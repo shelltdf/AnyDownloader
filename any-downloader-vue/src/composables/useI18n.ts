@@ -18,7 +18,7 @@ const messages: Record<Locale, Record<string, string>> = {
     menuWindow: '窗口',
     menuHelp: '帮助',
     addUrl: '添加地址…',
-    addUrlOnly: '仅添加到队列（不开始）',
+    addUrlOnly: '添加队列',
     pasteUrl: '粘贴并添加',
     fileStart: '开始所选',
     filePause: '暂停所选',
@@ -53,7 +53,7 @@ const messages: Record<Locale, Record<string, string>> = {
     speedTesting: '测速中…',
     speedResult: '估算带宽',
     speedFail: '测速失败（可能被 CORS 或网络阻止）',
-    chunkHint: '按接收进度映射为 32 块（示意）',
+    chunkHint: '32 格：深=已下完，亮=传输中，灰=未开始',
     logTitle: '日志',
     logCopy: '复制全文',
     logEmpty: '暂无日志记录。',
@@ -61,12 +61,11 @@ const messages: Record<Locale, Record<string, string>> = {
     dockMaximize: '最大化此面板（Dock View 内占满）',
     dockRestore: '还原面板布局',
     helpText:
-      '在工具栏输入或粘贴地址，点「添加任务」会加入列表并自动开始下载（新任务会自动选中）；「仅添加到队列」只入队不开始。\n\n'
-      + '【自动识别协议】先尝试将迅雷/快车/QQ旋风专用链解码为内层 HTTP 地址；再按前缀识别：HTTP/HTTPS、FTP/FTPS/SFTP、Magnet、eD2k、data:、blob:、'
-      + 'WebSocket(ws/wss)、file:、（未解码成功的）thunder/flashget/qqdl、IPFS/IPNS、RTSP、MMS、'
-      + 'S3(s3:)、Git(git:)、WebDAV(dav/davs) 等。\n\n'
-      + '【浏览器内实际可下】主要为 HTTP(S)、blob:、data:；其余协议会排队并提示需桌面壳或后端引擎。\n\n'
-      + '跨域资源受 CORS 限制时下载会失败，属站点策略而非本应用缺陷。',
+      '添加任务前须选择保存位置（支持「另存为」文件选择器；不支持时回退为输入文件名）。「添加任务」入队并立即开始；「添加队列」仅入队。\n'
+      + '支持从网页提取页面内全部 http(s) 链接批量入队（需页面允许 CORS，并选择保存目录）。\n\n'
+      + 'HTTP(S) 在支持 Range 时多连接并行下载；暂停会将进度写入本机 IndexedDB 以支持断点续传（同任务再次开始）。\n\n'
+      + '【协议识别】迅雷/快车/QQ 旋风链可展开为内层 HTTP；另有 Magnet、eD2k、FTP、WebDAV 等识别项，浏览器内主要可完成 HTTP(S)/data:/blob:。\n\n'
+      + '跨域受 CORS 限制，失败属站点策略。',
     aboutText: 'AnyDownloader — 通用下载管理（Vue + Vite）\n版本 0.1.0',
     urlPlaceholder: 'https://… 或 magnet:…',
     ready: '就绪',
@@ -82,6 +81,31 @@ const messages: Record<Locale, Record<string, string>> = {
     statusClickLog: '点击查看完整日志',
     noShortcut: '无全局快捷键',
     splitterDockCollapsed: '右侧 Dock 已全部折叠，请先通过「窗口」菜单展开任一面板再拖动分割条',
+    downloadMethods: '下载方式…',
+    speedColRegion: '区域',
+    speedColDown: '下载 Mbps',
+    speedUploadLabel: '上传（参考）',
+    speedUploadNote: '上传 POST 至美国 httpbin.org，与各区域下载节点不同，仅供上传带宽参考。',
+    pageFromWeb: '从网页提取链接…',
+    pageImportTitle: '从网页添加下载',
+    pageImportHint: '页面须允许浏览器跨域读取。选择保存目录后，每个文件写入该目录。',
+    pageUrlLabel: '页面地址',
+    pageFetch: '获取链接',
+    pagePickDir: '选择保存目录',
+    pageAddSelected: '添加所选到队列',
+    pageSelectAll: '全选',
+    pageClear: '清空',
+    pageLinks: '链接',
+    pageNoLinks: '未发现链接或无法跨域访问。',
+    pageDirRequired: '请先选择保存目录（需支持文件夹选择器的浏览器）。',
+    ctxStart: '开始',
+    ctxPause: '暂停',
+    ctxRemove: '删除',
+    ctxCopyUrl: '复制链接',
+    dockSpeedCurve: '速度曲线',
+    chunkLegendDone: '已下完',
+    chunkLegendActive: '传输中',
+    chunkLegendPending: '未开始',
   },
   en: {
     appTitle: 'AnyDownloader',
@@ -93,7 +117,7 @@ const messages: Record<Locale, Record<string, string>> = {
     menuWindow: 'Window',
     menuHelp: 'Help',
     addUrl: 'Add URL…',
-    addUrlOnly: 'Enqueue only (do not start)',
+    addUrlOnly: 'Add to queue',
     pasteUrl: 'Paste & add',
     fileStart: 'Start selected',
     filePause: 'Pause selected',
@@ -128,7 +152,7 @@ const messages: Record<Locale, Record<string, string>> = {
     speedTesting: 'Testing…',
     speedResult: 'Estimated throughput',
     speedFail: 'Speed test failed (CORS or network).',
-    chunkHint: '32 slots mapped from received bytes (illustrative)',
+    chunkHint: '32 slots: dark=done, bright=active, gray=pending',
     logTitle: 'Log',
     logCopy: 'Copy all',
     logEmpty: 'No log entries yet.',
@@ -136,10 +160,11 @@ const messages: Record<Locale, Record<string, string>> = {
     dockMaximize: 'Maximize panel (fill Dock View)',
     dockRestore: 'Restore dock layout',
     helpText:
-      'Enter a URL in the toolbar. “Add task” enqueues and starts the download (new tasks auto-select). “Enqueue only” adds without starting.\n\n'
-      + 'Protocol auto-detect: legacy thunder/flashget/qqdl links are decoded to inner HTTP when possible; then HTTP/HTTPS, FTP/FTPS/SFTP, Magnet, eD2k, data:, blob:, ws/wss, file:, raw thunder/flashget/qqdl, IPFS/IPNS, RTSP, MMS, s3:, git:, WebDAV (dav/davs), etc.\n\n'
-      + 'In-browser execution is mainly HTTP(S), blob:, data:; other schemes queue with a “needs desktop/engine” hint.\n\n'
-      + 'Cross-origin downloads may fail due to CORS — that is enforced by the remote site.',
+      'You must pick a save location before enqueueing (Save File picker, or filename prompt fallback). “Add task” starts immediately; “Add to queue” only enqueues.\n'
+      + 'Import all http(s) links from a page (CORS required) into the queue after choosing a save folder.\n\n'
+      + 'HTTP(S) uses parallel Range requests when supported; pause persists partial data to IndexedDB for resume.\n\n'
+      + 'Protocols: thunder/flashget/qqdl decode to HTTP when possible; Magnet/P2P/FTP/etc. are detected but need a native engine in-browser.\n\n'
+      + 'CORS failures are enforced by the remote site.',
     aboutText: 'AnyDownloader — download manager (Vue + Vite)\nVersion 0.1.0',
     urlPlaceholder: 'https://… or magnet:…',
     ready: 'Ready',
@@ -155,6 +180,31 @@ const messages: Record<Locale, Record<string, string>> = {
     statusClickLog: 'Click for full log',
     noShortcut: 'No global shortcut',
     splitterDockCollapsed: 'All right docks are collapsed; open one from Window menu to resize.',
+    downloadMethods: 'Download methods…',
+    speedColRegion: 'Region',
+    speedColDown: 'Download Mbps',
+    speedUploadLabel: 'Upload (ref.)',
+    speedUploadNote: 'Upload POST goes to US httpbin.org; not the same POP as regional downloads.',
+    pageFromWeb: 'Import links from page…',
+    pageImportTitle: 'Add downloads from page',
+    pageImportHint: 'The page must allow cross-origin fetch. Pick a folder; each file is created there.',
+    pageUrlLabel: 'Page URL',
+    pageFetch: 'Fetch links',
+    pagePickDir: 'Choose save folder',
+    pageAddSelected: 'Enqueue selected',
+    pageSelectAll: 'Select all',
+    pageClear: 'Clear',
+    pageLinks: 'Links',
+    pageNoLinks: 'No links found or fetch blocked (CORS).',
+    pageDirRequired: 'Choose a save folder first (browser must support directory picker).',
+    ctxStart: 'Start',
+    ctxPause: 'Pause',
+    ctxRemove: 'Remove',
+    ctxCopyUrl: 'Copy URL',
+    dockSpeedCurve: 'Speed curve',
+    chunkLegendDone: 'Done',
+    chunkLegendActive: 'Active',
+    chunkLegendPending: 'Pending',
   },
 }
 
