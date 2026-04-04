@@ -311,6 +311,7 @@ body {
   min-height: 0;
   overflow: hidden;
   min-width: 0;
+  align-items: stretch;
 }
 
 .download-list {
@@ -355,6 +356,10 @@ body {
   min-width: 0;
   min-height: 0;
   max-width: 600px;
+  max-height: 100%;
+  overflow: hidden;
+  align-items: stretch;
+  align-self: stretch;
 }
 
 .dock-area.dock-left {
@@ -366,14 +371,22 @@ body {
 }
 
 .dock-view {
-  flex: 1;
+  flex: 1 1 0;
   min-width: 0;
   min-height: 0;
+  max-height: 100%;
+  overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 6px;
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+/* 非最大化卡片保持内容高度，由 .dock-view 整体滚动，避免撑破主行 */
+.dock-view > .dock-card:not(.dock-card-max) {
+  flex-shrink: 0;
 }
 
 .dock-button-bar {
@@ -441,6 +454,23 @@ body {
   display: flex;
   align-items: center;
   gap: 2px;
+}
+
+.dock-btn-text {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  cursor: pointer;
+  color: var(--text-h);
+  font-size: 11px;
+  line-height: 1.2;
+  padding: 3px 8px;
+  border-radius: 4px;
+  margin-right: 4px;
+}
+
+.dock-btn-text:hover {
+  background: var(--accent-dim);
+  border-color: var(--accent);
 }
 
 .dock-max {
@@ -516,12 +546,17 @@ body {
 }
 
 .comm-log-pre-dock {
-  min-height: 56px;
+  box-sizing: border-box;
+  height: 200px;
+  min-height: 200px;
   max-height: 200px;
-  flex: 1;
+  flex: 0 0 auto;
 }
 
 .dock-card-comm-inline.dock-card-max .comm-log-pre-dock {
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 120px;
   max-height: none;
 }
 
@@ -721,6 +756,38 @@ body {
   padding: 16px;
 }
 
+.add-import-hint-backdrop {
+  z-index: 110;
+}
+
+.help-modal .help-advanced {
+  margin: 0 12px 12px;
+  padding: 0 4px;
+}
+
+.help-modal .help-advanced summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-h);
+  margin: 8px 0;
+  user-select: none;
+}
+
+.help-modal .help-pre-advanced {
+  max-height: min(48vh, 520px);
+  overflow: auto;
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.add-import-hint-pre {
+  white-space: pre-line;
+  line-height: 1.5;
+  margin: 0 0 12px;
+}
+
 .modal {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -774,14 +841,56 @@ body {
 }
 
 .video-ytdlp-log {
-  max-height: 220px;
+  box-sizing: border-box;
+  height: 240px;
+  min-height: 240px;
+  max-height: 240px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--bg);
 }
 
+.video-format-select {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  margin-bottom: 6px;
+}
+
+.video-embed-subs-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 10px;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--text-h);
+}
+
+.video-embed-subs-label input {
+  cursor: pointer;
+}
+
 .video-ytdlp-status-ok {
   color: var(--ok);
+}
+
+.bt-meta-dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.2rem 1rem;
+  margin: 0.5rem 0;
+  align-items: baseline;
+}
+
+.bt-meta-dl dt {
+  margin: 0;
+  opacity: 0.88;
+  font-weight: 500;
+}
+
+.bt-meta-dl dd {
+  margin: 0;
 }
 
 .speed-res {
@@ -851,12 +960,19 @@ body {
   color: var(--ok);
 }
 
+.chunk-legend-intro {
+  margin: 4px 0 2px;
+  line-height: 1.35;
+}
+
 .chunk-legend {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
-  margin: 6px 0;
+  margin: 4px 0 8px;
   font-size: 11px;
+  user-select: none;
+  pointer-events: none;
 }
 
 .chunk-legend .lg {
@@ -1035,6 +1151,28 @@ body {
   overflow: auto;
   border: 1px solid var(--border);
   border-radius: 8px;
+}
+
+.add-preserve-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 10px 8px 4px;
+  cursor: pointer;
+}
+
+.add-preserve-hint {
+  font-weight: normal;
+  opacity: 0.85;
+}
+
+.page-preserve-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 4px;
+  cursor: pointer;
 }
 
 .add-parse-table {
@@ -1302,6 +1440,84 @@ body {
 
 .global-body p {
   margin: 0 0 10px;
+}
+
+.global-body .policy-hint-block {
+  margin: 0 0 8px;
+  line-height: 1.4;
+}
+
+.global-body .policy-effective-row {
+  margin: 10px 0 6px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.global-body .policy-enforce-row {
+  margin: 0 0 10px;
+}
+
+.dock-body-buffers .buffer-ls-list {
+  margin: 6px 0 12px;
+  padding: 0;
+  list-style: none;
+}
+
+.dock-body-buffers .buffer-ls-item {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 6px 8px;
+  align-items: center;
+  font-size: 11px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.dock-body-buffers .buffer-ls-clear {
+  font-size: 11px;
+  padding: 3px 8px;
+}
+
+.dock-body-buffers .buffer-actions {
+  margin: 8px 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.dock-body-buffers .buffer-actions-danger {
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+
+.tb-btn.danger-btn {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
+  color: var(--danger);
+}
+
+.tb-btn.danger-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+}
+
+.dock-body-analysis .diag-pre {
+  margin: 8px 0 0;
+  max-height: min(420px, 50vh);
+  overflow: auto;
+  padding: 8px;
+  font-size: 10px;
+  line-height: 1.35;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.dock-card-analysis.dock-card-max .diag-pre {
+  max-height: none;
+  flex: 1;
+  min-height: 120px;
 }
 
 .inline-label {

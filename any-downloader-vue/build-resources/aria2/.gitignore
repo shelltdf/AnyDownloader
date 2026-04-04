@@ -1,0 +1,6 @@
+# 由 scripts/fetch-aria2-win.cjs 生成；不提交二进制
+aria2c.exe
+COPYING
+_download.zip
+_extract/
+_*.zip

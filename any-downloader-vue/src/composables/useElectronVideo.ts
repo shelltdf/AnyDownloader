@@ -2,12 +2,26 @@ import { onUnmounted, ref, watch } from 'vue'
 
 const LOG_CAP = 250_000
 
+/** 与 `electron/video-ytdlp.cjs` 中 `buildYtDlpFormatArgs` 白名单一致 */
+export type VideoYtdlpFormatPreset =
+  | 'default'
+  | 'best'
+  | '2160'
+  | '1440'
+  | '1080'
+  | '720'
+  | '480'
+  | 'audio'
+  | 'worst'
+
 export function useElectronVideo() {
   const videoModalOpen = ref(false)
   const videoUrl = ref('')
   const videoOutDir = ref<string | null>(null)
   const videoLog = ref('')
   const videoRunning = ref(false)
+  const videoFormatPreset = ref<VideoYtdlpFormatPreset>('best')
+  const videoEmbedSubs = ref(false)
   const ytdlpAvailable = ref<boolean | null>(null)
   const ytdlpVia = ref('')
 
@@ -131,7 +145,12 @@ export function useElectronVideo() {
     videoRunning.value = true
     videoLog.value = ''
     try {
-      const r = await shell.startVideoDownload({ url, outputDir })
+      const r = await shell.startVideoDownload({
+        url,
+        outputDir,
+        formatPreset: videoFormatPreset.value,
+        embedSubs: videoEmbedSubs.value,
+      })
       if (r && 'cancelled' in r && r.cancelled) {
         notify('info', messages.notifyVideoCancelled)
       } else if (r && 'ok' in r && r.ok) {
@@ -151,6 +170,8 @@ export function useElectronVideo() {
     videoOutDir,
     videoLog,
     videoRunning,
+    videoFormatPreset,
+    videoEmbedSubs,
     ytdlpAvailable,
     ytdlpVia,
     openVideoDownloadModal,

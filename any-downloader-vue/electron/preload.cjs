@@ -13,10 +13,31 @@ contextBridge.exposeInMainWorld('anyDownloaderShell', {
    */
   popupShellChromeMenu: (payload) => ipcRenderer.invoke('shell:popup-chrome-menu', payload),
   pickImportDirectory: () => ipcRenderer.invoke('shell:pick-import-dir'),
+  /** @returns {Promise<{ path: string, href: string, data: ArrayBuffer } | null>} */
+  pickTorrentFile: () => ipcRenderer.invoke('shell:pick-torrent-file'),
   /**
-   * @param {{ dirPath: string; fileName: string; data: ArrayBuffer }} opts
+   * @param {{ dirPath: string; fileName: string; data: ArrayBuffer; atomic?: boolean }} opts
    */
   writeImportFile: (opts) => ipcRenderer.invoke('shell:write-import-file', opts),
+  checkAria2: (force) => ipcRenderer.invoke('bt:check-aria2', { force: Boolean(force) }),
+  /**
+   * @param {{ outputDir: string; magnetUri?: string; torrentFileUrl?: string }} payload
+   */
+  startAria2Job: (payload) => ipcRenderer.invoke('bt:start', payload),
+  cancelAria2Job: () => ipcRenderer.invoke('bt:cancel'),
+  /**
+   * @param {(data: { chunk: string }) => void} callback
+   * @returns {() => void}
+   */
+  onAria2Log(callback) {
+    const handler = (_event, data) => {
+      callback(data)
+    }
+    ipcRenderer.on('bt:aria2-log', handler)
+    return () => {
+      ipcRenderer.removeListener('bt:aria2-log', handler)
+    }
+  },
   checkYtdlp: (force) => ipcRenderer.invoke('video:check-ytdlp', { force: Boolean(force) }),
   pickVideoOutputDir: () => ipcRenderer.invoke('video:pick-output-dir'),
   startVideoDownload: (payload) => ipcRenderer.invoke('video:start-download', payload),

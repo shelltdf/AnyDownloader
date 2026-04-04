@@ -14,4 +14,13 @@ export default defineConfig({
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version ?? '0.0.0'),
   },
+  resolve: {
+    /**
+     * parse-torrent 在 decodeTorrentFile 内使用 path.join.apply；Vite 默认对 `path` 的浏览器垫片不含 join，
+     * 会导致运行时「Cannot read properties of undefined (reading 'apply')」。
+     */
+    alias: {
+      path: 'path-browserify',
+    },
+  },
 })

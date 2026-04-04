@@ -9,8 +9,41 @@ export type SavePickResult = {
   electronOutputDir?: string | null
 }
 
-function sanitizeFileName(name: string): string {
+export function sanitizeFileName(name: string): string {
   return name.replace(/[/\\?%*:|"<>]/g, '_').slice(0, 200) || 'download'
+}
+
+/** 相对路径：逐段净化，用于目录句柄嵌套创建与 Electron 写盘 fileName */
+export function sanitizeRelativeSavePath(rel: string): string {
+  const parts = rel
+    .replace(/\\/g, '/')
+    .split('/')
+    .map((p) => sanitizeFileName(p.trim()))
+    .filter((p) => p.length > 0)
+  const joined = parts.join('/')
+  return joined.length > 500 ? joined.slice(0, 500) : joined || 'download'
+}
+
+/**
+ * 在已授权目录下按相对路径创建子目录并创建文件句柄（File System Access API）。
+ */
+export async function getOrCreateFileHandleInDirectory(
+  root: FileSystemDirectoryHandle,
+  relativePath: string,
+): Promise<FileSystemFileHandle> {
+  const parts = relativePath
+    .replace(/\\/g, '/')
+    .split('/')
+    .map((p) => p.trim())
+    .filter(Boolean)
+  if (!parts.length) throw new Error('empty path')
+  const safe = parts.map((p) => sanitizeFileName(p))
+  const fileName = safe.pop()!
+  let dir = root
+  for (const seg of safe) {
+    dir = await dir.getDirectoryHandle(seg, { create: true })
+  }
+  return dir.getFileHandle(fileName, { create: true })
 }
 
 type SavePickerFn = (options?: {

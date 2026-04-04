@@ -5,7 +5,9 @@
 const { app, BrowserWindow, ipcMain, Menu, dialog, nativeImage } = require('electron')
 const fs = require('fs')
 const path = require('path')
+const { pathToFileURL } = require('url')
 const { registerVideoYtdlpIpc } = require('./video-ytdlp.cjs')
+const { registerAria2BtIpc } = require('./aria2-bt.cjs')
 
 const pkg = (() => {
   try {
@@ -43,10 +45,24 @@ function saveWindowPrefs() {
   }
 }
 
-function sanitizeImportFileName(name) {
-  return String(name || 'download')
+function sanitizePathSegment(seg) {
+  const s = String(seg || '')
     .replace(/[/\\?%*:|"<>]/g, '_')
-    .slice(0, 200) || 'download'
+    .replace(/^\.+$/, '_')
+    .slice(0, 200)
+  return s || '_'
+}
+
+/** 允许相对子路径（段内净化），总长约上限 */
+function sanitizeImportRelativePath(rel) {
+  const parts = String(rel || '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .map((s) => sanitizePathSegment(s.trim()))
+    .filter((s) => s.length > 0 && s !== '.')
+  if (parts.length === 0) return 'download'
+  const joined = parts.join('/')
+  return joined.length > 500 ? joined.slice(0, 500) : joined
 }
 
 /** 与页内 favicon / 构建产物图标一致（build-resources/icon.png，由 scripts/gen-app-icon.cjs 生成） */
@@ -209,6 +225,18 @@ app.whenReady().then(() => {
   createWindow(null)
 
   registerVideoYtdlpIpc(ipcMain, dialog, BrowserWindow)
+  const aria2Bt = registerAria2BtIpc(ipcMain)
+
+  /** BT：退出前温和结束 aria2，便于 DHT 落盘（强杀/断电仍可能损坏，见 aria2-bt.cjs 注释） */
+  let allowQuitAfterAria2 = false
+  app.on('before-quit', (e) => {
+    if (allowQuitAfterAria2) return
+    e.preventDefault()
+    void aria2Bt.gracefulShutdownAllAria2(6000).finally(() => {
+      allowQuitAfterAria2 = true
+      app.quit()
+    })
+  })
 
   ipcMain.handle('shell:get-version', () => String(pkg.version || ''))
 
@@ -271,10 +299,33 @@ app.whenReady().then(() => {
     return { path: r.filePaths[0] }
   })
 
+  /** 选择本地 .torrent 并读入缓冲区，供渲染进程解析（无需依赖 File.path） */
+  ipcMain.handle('shell:pick-torrent-file', async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    const bw = win && !win.isDestroyed() ? win : undefined
+    const zh = String(app.getLocale() || '')
+      .toLowerCase()
+      .startsWith('zh')
+    const r = await dialog.showOpenDialog(bw, {
+      properties: ['openFile'],
+      filters: [{ name: 'BitTorrent', extensions: ['torrent'] }],
+      title: zh ? '选择 BT 种子文件' : 'Choose .torrent file',
+    })
+    if (r.canceled || !r.filePaths.length) return null
+    const filePath = r.filePaths[0]
+    const buf = await fs.promises.readFile(filePath)
+    const u8 = new Uint8Array(buf)
+    return {
+      path: filePath,
+      href: pathToFileURL(filePath).href,
+      data: u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength),
+    }
+  })
+
   ipcMain.handle('shell:write-import-file', async (_event, payload) => {
     const p = payload && typeof payload === 'object' ? payload : {}
     const dirPath = String(p.dirPath || '').trim()
-    const fileName = sanitizeImportFileName(p.fileName)
+    const fileName = sanitizeImportRelativePath(p.fileName)
     if (!dirPath || !fileName) throw new Error('INVALID_ARGS')
     const dirAbs = path.resolve(dirPath)
     let st
@@ -293,7 +344,24 @@ app.whenReady().then(() => {
     else if (raw instanceof ArrayBuffer) buf = Buffer.from(new Uint8Array(raw))
     else if (ArrayBuffer.isView(raw)) buf = Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength)
     else throw new Error('NO_DATA')
-    await fs.promises.writeFile(outAbs, buf)
+    await fs.promises.mkdir(path.dirname(outAbs), { recursive: true })
+    const atomic = p.atomic !== false
+    if (atomic) {
+      const partAbs = `${outAbs}.part`
+      try {
+        await fs.promises.writeFile(partAbs, buf)
+        await fs.promises.rename(partAbs, outAbs)
+      } catch (e) {
+        try {
+          await fs.promises.unlink(partAbs)
+        } catch {
+          /* ignore */
+        }
+        throw e
+      }
+    } else {
+      await fs.promises.writeFile(outAbs, buf)
+    }
     return { ok: true }
   })
 

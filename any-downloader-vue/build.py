@@ -103,6 +103,17 @@ def main() -> int:
         else:
             targets = ["--linux", "AppImage", "deb", "--win", "nsis"]
 
+    # Windows 安装包内置 aria2c、yt-dlp.exe（extraResources）
+    if "--win" in targets:
+        for script in ("scripts/fetch-aria2-win.cjs", "scripts/fetch-ytdlp-win.cjs"):
+            fetch = subprocess.call(
+                ["node", script],
+                cwd=str(root),
+                shell=False,
+            )
+            if fetch != 0:
+                return fetch
+
     args = ["npx", "--yes", "electron-builder", *targets]
     print("build:", " ".join(args))
     return subprocess.call(args, cwd=str(root))

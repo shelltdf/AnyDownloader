@@ -11,18 +11,24 @@
     "dev": "vite",
     "prebuild": "node scripts/gen-app-icon.cjs",
     "build": "vue-tsc -b && vite build",
+    "build:watch": "vite build --watch",
     "preview": "vite preview",
     "electron:dev": "concurrently -k \"npm run dev\" \"wait-on http://127.0.0.1:5173 && cross-env ELECTRON_DEV=1 electron .\"",
-    "electron:pack": "npm run build && electron-builder --dir",
-    "electron:dist": "npm run build && electron-builder"
+    "fetch:aria2": "node scripts/fetch-aria2-win.cjs",
+    "fetch:ytdlp": "node scripts/fetch-ytdlp-win.cjs",
+    "electron:pack": "node scripts/clean-release.cjs && node scripts/fetch-aria2-win.cjs && node scripts/fetch-ytdlp-win.cjs && npm run build && electron-builder --dir",
+    "electron:dist": "node scripts/clean-release.cjs && node scripts/fetch-aria2-win.cjs && node scripts/fetch-ytdlp-win.cjs && npm run build && electron-builder"
   },
   "dependencies": {
+    "parse-torrent": "^11.0.19",
+    "path-browserify": "^1.0.1",
     "vue": "^3.5.30"
   },
   "devDependencies": {
     "@types/node": "^24.12.0",
     "@vitejs/plugin-vue": "^6.0.5",
     "@vue/tsconfig": "^0.9.0",
+    "adm-zip": "^0.5.17",
     "concurrently": "^9.2.0",
     "cross-env": "^7.0.3",
     "electron": "^33.2.0",
@@ -55,6 +61,25 @@
           "target": "nsis",
           "arch": [
             "x64"
+          ]
+        }
+      ],
+      "extraResources": [
+        {
+          "from": "build-resources/aria2",
+          "to": "aria2",
+          "filter": [
+            "aria2c.exe",
+            "COPYING",
+            "README.md"
+          ]
+        },
+        {
+          "from": "build-resources/yt-dlp",
+          "to": "yt-dlp",
+          "filter": [
+            "yt-dlp.exe",
+            "README.md"
           ]
         }
       ]

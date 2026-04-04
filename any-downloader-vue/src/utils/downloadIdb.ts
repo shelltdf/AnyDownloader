@@ -1,7 +1,10 @@
 /** 断点续传：分片元数据与已完成分片字节（IndexedDB） */
 
-const DB_NAME = 'any-downloader-resume-v1'
-const STORE = 'partials'
+export const IDB_RESUME_DB_NAME = 'any-downloader-resume-v1'
+export const IDB_RESUME_STORE = 'partials'
+
+const DB_NAME = IDB_RESUME_DB_NAME
+const STORE = IDB_RESUME_STORE
 const DB_VER = 1
 
 export interface PersistedPart {
@@ -61,5 +64,26 @@ export async function idbDeletePartial(id: string): Promise<void> {
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
     tx.objectStore(STORE).delete(id)
+  })
+}
+
+/** 清空断点续传库中全部记录（不影响任务列表，仅磁盘缓存） */
+export async function idbClearAllPartials(): Promise<void> {
+  const db = await openDb()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite')
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+    tx.objectStore(STORE).clear()
+  })
+}
+
+export async function idbCountPartials(): Promise<number> {
+  const db = await openDb()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readonly')
+    const req = tx.objectStore(STORE).count()
+    req.onsuccess = () => resolve(Number(req.result) || 0)
+    req.onerror = () => reject(req.error)
   })
 }

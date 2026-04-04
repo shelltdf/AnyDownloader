@@ -1,8 +1,9 @@
 import { ref, watch } from 'vue'
+import { APP_STORAGE_KEYS } from '../constants/appStorageKeys'
 
-const STORAGE_MODE = 'any-downloader-concurrency-mode'
-const STORAGE_MAX = 'any-downloader-concurrency-max'
-const STORAGE_PRESSURE = 'any-downloader-pressure'
+const STORAGE_MODE = APP_STORAGE_KEYS.CONCURRENCY_MODE
+const STORAGE_MAX = APP_STORAGE_KEYS.CONCURRENCY_MAX
+const STORAGE_PRESSURE = APP_STORAGE_KEYS.PRESSURE
 
 export type TaskConcurrencyMode = 'auto' | 'manual'
 export type PressureStrategy = 'min' | 'balanced' | 'max'
@@ -26,6 +27,11 @@ function loadPolicy() {
 }
 
 loadPolicy()
+
+/** 从 localStorage 重新加载（在用户单独清除某项后调用） */
+export function reloadPolicyFromStorage() {
+  loadPolicy()
+}
 
 watch([taskConcurrencyMode, maxConcurrentTasksManual, pressureStrategy], () => {
   try {

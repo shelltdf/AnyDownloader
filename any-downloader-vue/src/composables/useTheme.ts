@@ -1,10 +1,11 @@
 import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { APP_STORAGE_KEYS } from '../constants/appStorageKeys'
 import { useLog } from './useLog'
 import { tMsg } from './useI18n'
 
 export type ThemeMode = 'system' | 'light' | 'dark'
 
-const STORAGE_KEY = 'any-downloader-theme'
+const STORAGE_KEY = APP_STORAGE_KEYS.THEME
 
 export const themeMode = ref<ThemeMode>('system')
 
@@ -29,6 +30,12 @@ export function applyDomTheme(m: ThemeMode) {
 }
 
 export function applyStoredThemeOnBoot() {
+  themeMode.value = readStored()
+  applyDomTheme(themeMode.value)
+}
+
+/** 在清除 theme 的 localStorage 项后调用，使界面与存储一致 */
+export function syncThemeFromStorage() {
   themeMode.value = readStored()
   applyDomTheme(themeMode.value)
 }

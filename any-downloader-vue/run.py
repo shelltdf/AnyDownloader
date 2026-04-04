@@ -3,8 +3,12 @@
 """
 启动已打包的 Electron 桌面程序（``release/`` 下的免安装目录）。
 
-默认会在找不到可执行文件时**自动**执行 ``python build.py --electron-dir``
-（网页构建 + ``electron-builder --dir``，生成 ``win-unpacked`` / ``linux-unpacked`` / ``*.app``）。
+默认会在以下情况**自动**执行 ``python build.py --electron-dir``
+（``npm run build`` + ``electron-builder --dir``，生成 ``win-unpacked`` / ``linux-unpacked`` / ``*.app``）：
+
+- 找不到可执行文件；
+- **源码或配置比 ``dist/`` 新**（会先生成最新网页产物）；
+- **``dist/index.html`` 比当前可执行文件新**（网页已构建但未重新打 Electron 目录包）。
 
 若不想隐式打包，使用 ``python run.py --no-build``，仅报错并提示手动命令。
 
@@ -64,6 +68,88 @@ def _find_linux_bin(lu: Path) -> Optional[Path]:
     return None
 
 
+def _sources_latest_mtime(root: Path) -> float:
+    """与网页/Electron 相关的源码与配置的最新修改时间。"""
+    mt = 0.0
+    for sub in ("src", "electron"):
+        d = root / sub
+        if not d.is_dir():
+            continue
+        for p in d.rglob("*"):
+            if not p.is_file():
+                continue
+            if "node_modules" in p.parts:
+                continue
+            try:
+                mt = max(mt, p.stat().st_mtime)
+            except OSError:
+                pass
+    pub = root / "public"
+    if pub.is_dir():
+        for p in pub.rglob("*"):
+            if p.is_file():
+                try:
+                    mt = max(mt, p.stat().st_mtime)
+                except OSError:
+                    pass
+    for name in ("package.json", "package-lock.json", "index.html"):
+        f = root / name
+        if f.is_file():
+            try:
+                mt = max(mt, f.stat().st_mtime)
+            except OSError:
+                pass
+    for p in root.glob("vite.config.*"):
+        if p.is_file():
+            try:
+                mt = max(mt, p.stat().st_mtime)
+            except OSError:
+                pass
+    for p in root.glob("tsconfig*.json"):
+        if p.is_file():
+            try:
+                mt = max(mt, p.stat().st_mtime)
+            except OSError:
+                pass
+    icon_script = root / "scripts" / "gen-app-icon.cjs"
+    if icon_script.is_file():
+        try:
+            mt = max(mt, icon_script.stat().st_mtime)
+        except OSError:
+            pass
+    return mt
+
+
+def _should_repack_electron(root: Path, exe: Optional[Path]) -> bool:
+    """是否需要重新执行 build.py --electron-dir（生成最新 dist 并打 unpacked）。"""
+    dist_html = root / "dist" / "index.html"
+    src_mt = _sources_latest_mtime(root)
+    if not dist_html.is_file():
+        return True
+    dist_mt = dist_html.stat().st_mtime
+    if src_mt > dist_mt:
+        return True
+    if exe is None or not exe.is_file():
+        return True
+    try:
+        exe_mt = exe.stat().st_mtime
+    except OSError:
+        return True
+    if dist_mt > exe_mt:
+        return True
+    return False
+
+
+def _print_repack_banner(artifact: Optional[Path], missing_msg: str) -> None:
+    if artifact is None or not artifact.is_file():
+        print(f"run: {missing_msg}", flush=True)
+    else:
+        print(
+            "run: 检测到源码或 dist 已更新，正在执行 build.py --electron-dir…",
+            flush=True,
+        )
+
+
 def main() -> int:
     root = Path(__file__).resolve().parent
     rel = root / "release"
@@ -72,10 +158,10 @@ def main() -> int:
 
     if sys.platform == "win32":
         exe = _find_win_exe(rel)
-        if exe is None and not no_auto_build:
-            print(
-                "run: 未找到 AnyDownloader.exe，正在执行 build.py --electron-dir（首次较慢）…",
-                flush=True,
+        if not no_auto_build and _should_repack_electron(root, exe):
+            _print_repack_banner(
+                exe,
+                "未找到 AnyDownloader.exe，正在执行 build.py --electron-dir（首次较慢）…",
             )
             rc = _electron_dir_pack(root)
             if rc != 0:
@@ -93,11 +179,8 @@ def main() -> int:
 
     if sys.platform == "darwin":
         app = _find_mac_app(rel)
-        if app is None and not no_auto_build:
-            print(
-                "run: 未找到 AnyDownloader.app，正在执行 build.py --electron-dir…",
-                flush=True,
-            )
+        if not no_auto_build and _should_repack_electron(root, app):
+            _print_repack_banner(app, "未找到 AnyDownloader.app，正在执行 build.py --electron-dir…")
             rc = _electron_dir_pack(root)
             if rc != 0:
                 return rc
@@ -113,10 +196,10 @@ def main() -> int:
     # Linux
     lu = rel / "linux-unpacked"
     binary = _find_linux_bin(lu)
-    if binary is None and not no_auto_build:
-        print(
-            "run: 未找到 linux-unpacked 可执行文件，正在执行 build.py --electron-dir…",
-            flush=True,
+    if not no_auto_build and _should_repack_electron(root, binary):
+        _print_repack_banner(
+            binary,
+            "未找到 linux-unpacked 可执行文件，正在执行 build.py --electron-dir…",
         )
         rc = _electron_dir_pack(root)
         if rc != 0:

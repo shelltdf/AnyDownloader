@@ -1,7 +1,14 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { protocolLabel, type DetectedProtocol, type ProtocolDetectResult } from '../utils/protocol'
 import type { SavePickResult } from '../utils/savePicker'
-import { idbDeletePartial, idbLoadPartial, idbSavePartial, type PersistedHttpTask } from '../utils/downloadIdb'
+import { APP_STORAGE_KEYS } from '../constants/appStorageKeys'
+import {
+  idbClearAllPartials,
+  idbDeletePartial,
+  idbLoadPartial,
+  idbSavePartial,
+  type PersistedHttpTask,
+} from '../utils/downloadIdb'
 import { useDownloadThreads } from './useDownloadThreads'
 import {
   effectiveMaxConcurrentTasks,
@@ -12,6 +19,10 @@ import {
 } from './useDownloadPolicy'
 import { useLog } from './useLog'
 import { tMsg } from './useI18n'
+import {
+  parseLastAria2ProgressFromLine,
+  stripTerminalCarriageReturn,
+} from '../utils/aria2ProgressParse'
 
 /** 选中任务与服务器 HTTP 交互摘要（按任务 id） */
 export const taskCommLogs = reactive<Record<string, string[]>>({})
@@ -27,6 +38,44 @@ function appendTaskCommLog(taskId: string, line: string) {
 
 function clearTaskCommLog(taskId: string) {
   delete taskCommLogs[taskId]
+}
+
+function beginRunSegment(task: DownloadTask) {
+  if (task.runSegmentStartedAt != null) return
+  const now = Date.now()
+  task.runSegmentStartedAt = now
+  if (task.runStartedAt == null) task.runStartedAt = now
+}
+
+function endRunSegment(task: DownloadTask) {
+  if (task.runSegmentStartedAt == null) return
+  task.elapsedActiveMs += Date.now() - task.runSegmentStartedAt
+  task.runSegmentStartedAt = null
+}
+
+/**
+ * 用于界面「已用」：暂停时冻结；running 时含本段；旧任务无 elapsed 时回退到 runFinishedAt-runStartedAt。
+ */
+export function taskActiveElapsedMs(task: DownloadTask): number | null {
+  if (task.status === 'queued' && task.runStartedAt == null) return null
+  if (task.status === 'done' || task.status === 'error') {
+    if (task.elapsedActiveMs > 0) return task.elapsedActiveMs
+    const end = task.runFinishedAt ?? Date.now()
+    if (task.runStartedAt == null) return 0
+    return end - task.runStartedAt
+  }
+  if (task.status === 'paused') return task.elapsedActiveMs
+  if (task.status === 'queued') return task.elapsedActiveMs
+  if (task.status === 'running') {
+    const seg = task.runSegmentStartedAt != null ? Date.now() - task.runSegmentStartedAt : 0
+    return task.elapsedActiveMs + seg
+  }
+  return task.elapsedActiveMs
+}
+
+/** 去掉 aria2 stderr 中的 ANSI，便于去重与阅读 */
+function stripAnsiCommLogLine(s: string): string {
+  return s.replace(/\u001b\[[0-9;]*m/g, '').replace(/\r/g, '').trim()
 }
 
 function formatLoggedHeaders(res: Response): string {
@@ -131,6 +180,10 @@ export interface DownloadTask {
   runStartedAt: number | null
   /** 进入完成或错误态的时刻（ms），用于冻结已用时间展示 */
   runFinishedAt: number | null
+  /** 累计「有效下载」时长（ms），不含排队与暂停期间；与 runSegmentStartedAt 配合 */
+  elapsedActiveMs: number
+  /** 当前 running 段开始时刻；非 running 或未开始本段时为 null */
+  runSegmentStartedAt: number | null
   /** 当前 HTTP 并行连接数；非 running 时为 0 */
   activeConnections: number
   /** 网络数据已收齐，正在写入磁盘 / 触发保存 */
@@ -245,6 +298,7 @@ async function writeFinalBlob(task: DownloadTask, blob: Blob) {
       dirPath: electronDir,
       fileName: task.saveFileName,
       data: buf,
+      atomic: true,
     })
     recordDiskWrite(blob.size, performance.now() - t0)
     return
@@ -540,7 +594,7 @@ async function runHttpMultipart(task: DownloadTask, corsMsg: string) {
   task.isWriting = false
   task.activeConnections = 0
   task.singleConnReason = 'none'
-  if (task.runStartedAt == null) task.runStartedAt = Date.now()
+  beginRunSegment(task)
   startSpeedSampler(task)
 
   let multipartPersistTicker: ReturnType<typeof setInterval> | null = null
@@ -662,6 +716,7 @@ async function runHttpMultipart(task: DownloadTask, corsMsg: string) {
     await writeFinalBlob(task, blob)
     task.isWriting = false
     task.progress = 1
+    endRunSegment(task)
     task.runFinishedAt = Date.now()
     task.status = 'done'
     sessionDownloadInfo.connectionKind = 'none'
@@ -671,6 +726,7 @@ async function runHttpMultipart(task: DownloadTask, corsMsg: string) {
   } catch (e) {
     const err = e as Error
     if (err.name === 'AbortError') {
+      endRunSegment(task)
       task.status = 'paused'
       task.errorMessage = null
       if (task._parts && task.totalBytes) {
@@ -681,6 +737,7 @@ async function runHttpMultipart(task: DownloadTask, corsMsg: string) {
       }
       log('info', `已暂停: ${task.displayUrl}`)
     } else {
+      endRunSegment(task)
       task.runFinishedAt = Date.now()
       task.status = 'error'
       const isNet =
@@ -719,7 +776,6 @@ async function runHttpSingleStream(task: DownloadTask, ac: AbortController) {
   task._multipart = false
   task._parts = null
   task.activeConnections = 1
-  if (task.runStartedAt == null) task.runStartedAt = Date.now()
   task.speedBps = 0
   const res = await loggedFetch(task.id, 'GET', task.href, { signal: ac.signal, mode: 'cors', cache: 'no-store' })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -795,6 +851,7 @@ async function runHttpSingleStream(task: DownloadTask, ac: AbortController) {
     await writeFinalBlob(task, blob)
     task.isWriting = false
     task.progress = 1
+    endRunSegment(task)
     task.runFinishedAt = Date.now()
     task.status = 'done'
     await idbDeletePartial(task.id)
@@ -819,7 +876,7 @@ async function runDataTask(task: DownloadTask) {
   task.errorMessage = null
   task.isWriting = false
   task.activeConnections = 1
-  if (task.runStartedAt == null) task.runStartedAt = Date.now()
+  beginRunSegment(task)
   startSpeedSampler(task)
   try {
     const res = await loggedFetch(task.id, 'GET data:', task.href)
@@ -838,11 +895,13 @@ async function runDataTask(task: DownloadTask) {
     await writeFinalBlob(task, blob)
     task.isWriting = false
     task.progress = 1
+    endRunSegment(task)
     task.runFinishedAt = Date.now()
     task.status = 'done'
     task.activeConnections = 0
     log('info', `完成: ${task.saveFileName} (${blob.size} B)`)
   } catch (e) {
+    endRunSegment(task)
     task.runFinishedAt = Date.now()
     task.status = 'error'
     task.errorMessage = (e as Error).message
@@ -887,6 +946,8 @@ function makeTask(det: ProtocolDetectResult, save: SavePickResult): DownloadTask
     threadOverride: null,
     runStartedAt: null,
     runFinishedAt: null,
+    elapsedActiveMs: 0,
+    runSegmentStartedAt: null,
     activeConnections: 0,
     isWriting: false,
     singleConnReason: 'none',
@@ -908,6 +969,8 @@ function resetTaskProgress(task: DownloadTask) {
   task._multipart = false
   task.runStartedAt = null
   task.runFinishedAt = null
+  task.elapsedActiveMs = 0
+  task.runSegmentStartedAt = null
   task.activeConnections = 0
   task.isWriting = false
   task.singleConnReason = 'none'
@@ -915,7 +978,7 @@ function resetTaskProgress(task: DownloadTask) {
 }
 
 // —— 任务列表持久化（localStorage）：关闭窗口/重启后保留，除非用户删除或清理完成项 ——
-const TASK_LIST_STORAGE_KEY = 'any-downloader-task-list-v1'
+const TASK_LIST_STORAGE_KEY = APP_STORAGE_KEYS.TASK_LIST
 
 interface PersistedTaskListRow {
   id: string
@@ -932,6 +995,7 @@ interface PersistedTaskListRow {
   threadOverride: number | null
   runStartedAt: number | null
   runFinishedAt: number | null
+  elapsedActiveMs?: number
   chunkSlots: ChunkSlotState[]
   chunkFill: number[]
   singleConnReason: SingleConnReason
@@ -954,6 +1018,7 @@ function serializeTaskForList(t: DownloadTask): PersistedTaskListRow {
     threadOverride: t.threadOverride,
     runStartedAt: t.runStartedAt,
     runFinishedAt: t.runFinishedAt,
+    elapsedActiveMs: t.elapsedActiveMs,
     chunkSlots: [...t.chunkSlots],
     chunkFill: [...t.chunkFill],
     singleConnReason: t.singleConnReason,
@@ -996,6 +1061,8 @@ function deserializeTaskRow(row: PersistedTaskListRow): DownloadTask {
         : null,
     runStartedAt: row.runStartedAt,
     runFinishedAt: row.runFinishedAt,
+    elapsedActiveMs: row.elapsedActiveMs != null && Number.isFinite(row.elapsedActiveMs) ? Math.max(0, row.elapsedActiveMs) : 0,
+    runSegmentStartedAt: null,
     activeConnections: 0,
     isWriting: false,
     singleConnReason: row.singleConnReason ?? 'none',
@@ -1129,8 +1196,35 @@ export function useDownloads() {
     void runTaskWrapped(next, lastErrBackend, lastCorsMsg)
   }
 
-  watch([taskConcurrencyMode, maxConcurrentTasksManual, pressureStrategy], () => {
+  /**
+   * 使「并行任务上限」立即生效：若运行中数量超过上限，按任务列表顺序保留靠前的任务，暂停其余。
+   * @param opts.notify 为 true 时弹出摘要（用于用户点击「整理」）；否则仅写入日志（用于策略变更自动执行）。
+   */
+  function enforceConcurrencyLimit(opts?: { notify?: boolean }): number {
+    const limit = effectiveMaxConcurrentTasks()
+    const runningInOrder: DownloadTask[] = []
+    for (const t of tasks) {
+      if (t.status === 'running') runningInOrder.push(t)
+    }
+    let n = 0
+    if (runningInOrder.length > limit) {
+      for (const t of runningInOrder.slice(limit)) {
+        t.abort?.abort()
+        n++
+      }
+    }
     void pumpDownloadQueue()
+    if (opts?.notify) {
+      if (n > 0) notify('info', tMsg('policyEnforcePaused', { n }))
+      else notify('info', tMsg('policyEnforceOk'))
+    } else if (n > 0) {
+      log('info', tMsg('policyAutoPaused', { n }))
+    }
+    return n
+  }
+
+  watch([taskConcurrencyMode, maxConcurrentTasksManual, pressureStrategy], () => {
+    enforceConcurrencyLimit()
   })
 
   async function runTaskWrapped(task: DownloadTask, errNeedBackend: string, corsMsg: string) {
@@ -1138,6 +1232,169 @@ export function useDownloads() {
       await runTask(task, errNeedBackend, corsMsg)
     } finally {
       void pumpDownloadQueue()
+    }
+  }
+
+  async function runAria2BtTask(task: DownloadTask, errNeedBackend: string) {
+    const dir = task.electronOutputDir?.trim()
+    const shell = typeof window !== 'undefined' ? window.anyDownloaderShell : undefined
+    if (!dir || !shell?.startAria2Job) {
+      placeholderFail(task, errNeedBackend)
+      return
+    }
+    const check = await shell.checkAria2?.(false)
+    if (!check?.available) {
+      placeholderFail(task, tMsg('errAria2Missing'))
+      return
+    }
+
+    const ac = new AbortController()
+    task.abort = ac
+    task.status = 'running'
+    task.errorMessage = null
+    task.speedBps = 0
+    task.isWriting = false
+    task.activeConnections = 1
+    sessionDownloadInfo.connectionKind = 'single'
+    sessionDownloadInfo.activeThreads = 1
+    beginRunSegment(task)
+    for (let i = 0; i < CHUNK_SLOTS; i++) {
+      task.chunkSlots[i] = 'active'
+      task.chunkFill[i] = 0.2
+    }
+    startSpeedSampler(task)
+
+    const onAbort = () => {
+      void shell.cancelAria2Job?.()
+    }
+    ac.signal.addEventListener('abort', onAbort)
+    let lastEmittedLine = ''
+    let lastProgressKey = ''
+    let lastProgressEmitAt = 0
+    let lastSummaryEmitAt = 0
+    let lastFileLine = ''
+    let lastFileEmitAt = 0
+    /** 与 parseLastAria2ProgressFromLine 一致：单行可含多段 `[#…]`；`DL:` 后可直接紧接 `]` */
+    const PROGRESS_RE = /\[#\S+\s+\S+\/\S+(?:\([^)]*\))?\s+CN:\d+\s+SD:\d+\s+DL:[^\s\]]+/
+    /** stderr 可能按块到达，半行需拼到下一 chunk 再解析 */
+    let aria2LineBuf = ''
+    const applyAria2ProgressFromCleaned = (cleaned: string) => {
+      const prog = parseLastAria2ProgressFromLine(cleaned)
+      if (!prog || task.status !== 'running' || prog.totalBytes <= 0) return
+      task.bytesReceived = Math.min(prog.completedBytes, prog.totalBytes)
+      task.totalBytes = prog.totalBytes
+      task.speedBps = prog.dlBps
+      task.activeConnections = Math.max(1, prog.connectionCount)
+      capBytesToTotal(task)
+      clampProgress(task)
+      refreshChunkSlotsFromBytes(task)
+    }
+    const unsubLog = shell.onAria2Log?.((d) => {
+      const now = Date.now()
+      aria2LineBuf += d.chunk
+      /** 管道中非 TTY 时，进度多为「同一行用 \\r 刷新」且长时间无 \\n，仅 split('\\n') 会一直卡在缓冲区 → 界面不更新 */
+      if (aria2LineBuf.length > 65536) {
+        aria2LineBuf = aria2LineBuf.slice(-32768)
+      }
+      const splitLines = aria2LineBuf.split('\n')
+      aria2LineBuf = splitLines.pop() ?? ''
+      for (const raw of splitLines) {
+        const rawLine = stripTerminalCarriageReturn(raw)
+        const cleaned = stripAnsiCommLogLine(rawLine)
+        if (!cleaned) continue
+
+        applyAria2ProgressFromCleaned(cleaned)
+
+        if (/^={3,}$/.test(cleaned) || /^-{3,}$/.test(cleaned)) continue
+
+        if (cleaned.startsWith('*** Download Progress Summary')) {
+          if (now - lastSummaryEmitAt < 20000) continue
+          lastSummaryEmitAt = now
+        } else if (PROGRESS_RE.test(cleaned)) {
+          const key = cleaned.replace(/\s+/g, ' ')
+          if (key === lastProgressKey && now - lastProgressEmitAt < 12000) continue
+          lastProgressKey = key
+          lastProgressEmitAt = now
+        } else if (cleaned.startsWith('FILE:')) {
+          if (cleaned === lastFileLine && now - lastFileEmitAt < 15000) continue
+          lastFileLine = cleaned
+          lastFileEmitAt = now
+        }
+
+        if (cleaned === lastEmittedLine) continue
+        lastEmittedLine = cleaned
+        appendTaskCommLog(task.id, cleaned.slice(0, 400))
+      }
+      const tailLive = stripTerminalCarriageReturn(aria2LineBuf)
+      const cleanedTail = stripAnsiCommLogLine(tailLive)
+      if (cleanedTail) {
+        applyAria2ProgressFromCleaned(cleanedTail)
+      }
+    })
+
+    try {
+      const payload: { outputDir: string; magnetUri?: string; torrentFileUrl?: string } = { outputDir: dir }
+      if (task.protocol === 'magnet') payload.magnetUri = task.href
+      else payload.torrentFileUrl = task.href
+      const result = await shell.startAria2Job(payload)
+      if (!result.ok) {
+        endRunSegment(task)
+        task.status = 'paused'
+        task.errorMessage = null
+        task.activeConnections = 0
+        for (let i = 0; i < CHUNK_SLOTS; i++) {
+          task.chunkSlots[i] = 'paused'
+          task.chunkFill[i] = 0.2
+        }
+        log('info', `BT 已暂停: ${task.displayUrl}`)
+        return
+      }
+      endRunSegment(task)
+      task.runFinishedAt = Date.now()
+      task.status = 'done'
+      if (task.totalBytes != null && task.totalBytes > 0) {
+        task.bytesReceived = task.totalBytes
+      }
+      task.progress = 1
+      task.speedBps = 0
+      task.activeConnections = 0
+      for (let i = 0; i < CHUNK_SLOTS; i++) {
+        task.chunkSlots[i] = 'done'
+        task.chunkFill[i] = 1
+      }
+      log('info', `BT 完成: ${task.displayUrl}`)
+    } catch (e) {
+      const err = e as Error
+      if (ac.signal.aborted) {
+        endRunSegment(task)
+        task.status = 'paused'
+        task.errorMessage = null
+        task.activeConnections = 0
+        for (let i = 0; i < CHUNK_SLOTS; i++) {
+          task.chunkSlots[i] = 'paused'
+          task.chunkFill[i] = 0.2
+        }
+        log('info', `BT 已暂停: ${task.displayUrl}`)
+      } else {
+        endRunSegment(task)
+        task.runFinishedAt = Date.now()
+        task.status = 'error'
+        task.errorMessage = err.message
+        task.activeConnections = 0
+        notify('error', `${task.displayUrl}: ${task.errorMessage}`)
+      }
+    } finally {
+      ac.signal.removeEventListener('abort', onAbort)
+      if (aria2LineBuf.trim()) {
+        const cleaned = stripAnsiCommLogLine(stripTerminalCarriageReturn(aria2LineBuf))
+        applyAria2ProgressFromCleaned(cleaned)
+      }
+      unsubLog?.()
+      stopSpeedSampler(task)
+      task.abort = null
+      task.activeConnections = 0
+      sessionDownloadInfo.connectionKind = 'none'
+      sessionDownloadInfo.activeThreads = null
     }
   }
 
@@ -1150,6 +1407,23 @@ export function useDownloads() {
     if (task.protocol === 'data') {
       await runDataTask(task)
       return
+    }
+    if (task.protocol === 'magnet') {
+      await runAria2BtTask(task, errNeedBackend)
+      return
+    }
+    if (task.protocol === 'file') {
+      try {
+        if (/\.torrent$/i.test(new URL(task.href).pathname)) {
+          await runAria2BtTask(task, errNeedBackend)
+          return
+        }
+      } catch {
+        if (/\.torrent$/i.test(task.href)) {
+          await runAria2BtTask(task, errNeedBackend)
+          return
+        }
+      }
     }
     placeholderFail(task, errNeedBackend)
   }
@@ -1241,6 +1515,10 @@ export function useDownloads() {
 
   const runningDownloadCount = computed(() => tasks.filter((t) => t.status === 'running').length)
 
+  async function clearAllResumeIdb(): Promise<void> {
+    await idbClearAllPartials()
+  }
+
   return {
     tasks,
     selectedId,
@@ -1261,5 +1539,7 @@ export function useDownloads() {
     pauseTask,
     pauseAll,
     pauseSelected,
+    enforceConcurrencyLimit,
+    clearAllResumeIdb,
   }
 }

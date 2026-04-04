@@ -152,12 +152,31 @@ export async function extractHttpLinksFromPage(
 }
 
 export function guessNameFromUrl(url: string): string {
+  const t = url.trim()
+  if (/^magnet:/i.test(t)) {
+    const q = t.includes('?') ? t.slice(t.indexOf('?') + 1) : ''
+    const m = /(?:^|&)dn=([^&]+)/i.exec(q)
+    if (m) {
+      try {
+        const n = decodeURIComponent(m[1])
+        if (n) return sanitizeMagnetDn(n)
+      } catch {
+        const n = m[1]
+        if (n) return sanitizeMagnetDn(n)
+      }
+    }
+    return 'magnet'
+  }
   try {
-    const u = new URL(url)
+    const u = new URL(t)
     const seg = u.pathname.split('/').filter(Boolean).pop()
     if (seg) return decodeURIComponent(seg.split('?')[0] || seg)
   } catch {
     /* ignore */
   }
   return 'download'
+}
+
+function sanitizeMagnetDn(name: string): string {
+  return name.replace(/[/\\?%*:|"<>]/g, '_').slice(0, 200) || 'magnet'
 }

@@ -7,19 +7,33 @@ import {
   sessionDownloadInfo,
   sessionIoStats,
   bytesReceivedForDisplay,
+  taskActiveElapsedMs,
   taskCommLogs,
   type DownloadTask,
   type SingleConnReason,
 } from './composables/useDownloads'
-import { useDownloadPolicy, effectiveMaxConcurrentTasks } from './composables/useDownloadPolicy'
-import { useDownloadThreads } from './composables/useDownloadThreads'
-import { useI18n } from './composables/useI18n'
+import {
+  useDownloadPolicy,
+  effectiveMaxConcurrentTasks,
+  pressureConnectionMultiplier,
+  reloadPolicyFromStorage,
+} from './composables/useDownloadPolicy'
+import { useDownloadThreads, reloadThreadSettingsFromStorage } from './composables/useDownloadThreads'
+import { useI18n, tMsg } from './composables/useI18n'
 import { useLog } from './composables/useLog'
 import { useSpeedTest } from './composables/useSpeedTest'
-import { useTheme } from './composables/useTheme'
+import { useTheme, syncThemeFromStorage } from './composables/useTheme'
 import { useElectronShell } from './composables/useElectronShell'
 import { useElectronVideo } from './composables/useElectronVideo'
-import { pickSaveLocation, pickSaveDirectory, type SavePickResult } from './utils/savePicker'
+import { useBtTorrentModal } from './composables/useBtTorrentModal'
+import {
+  pickSaveLocation,
+  pickSaveDirectory,
+  getOrCreateFileHandleInDirectory,
+  sanitizeRelativeSavePath,
+  type SavePickResult,
+} from './utils/savePicker'
+import { computeHttpBatchDirPrefix, relativeFilePathUnderUrlPrefix } from './utils/urlBatchRelativePath'
 import {
   extractHttpLinksFromPage,
   guessNameFromUrl,
@@ -31,9 +45,14 @@ import { extractUrlsFromText } from './utils/parseUrlsFromText'
 import { extractUrlsFromFileStream } from './utils/streamExtractUrlsFromFile'
 import { DOWNLOAD_METHOD_GROUPS } from './data/downloadMethodCatalog'
 import type { ChunkSlotState } from './composables/useDownloads'
+import { APP_STORAGE_KEYS, type AppStorageKey } from './constants/appStorageKeys'
+import { listAppLocalStorageRows, clearAppLocalStorageKey, clearAllKnownAppLocalStorage } from './utils/storageInventory'
+import type { LocalStorageRow } from './utils/storageInventory'
+import { idbCountPartials, IDB_RESUME_DB_NAME, IDB_RESUME_STORE } from './utils/downloadIdb'
+import { formatDiagnosticsReport } from './utils/diagnosticsReport'
 
 const { strings, setLocale, locale } = useI18n()
-const { lines, copyAll, log, notify, statusHintText, statusHintLevel } = useLog()
+const { lines, copyAll, log, notify, statusHintText, statusHintLevel, clear: clearLogLines } = useLog()
 const { setMode } = useTheme()
 const {
   isElectron,
@@ -51,6 +70,8 @@ const {
   videoOutDir,
   videoLog,
   videoRunning,
+  videoFormatPreset,
+  videoEmbedSubs,
   ytdlpAvailable,
   ytdlpVia,
   openVideoDownloadModal,
@@ -61,9 +82,123 @@ const {
   startVideoDownload,
 } = useElectronVideo()
 
+const videoYtdlpLogPre = ref<HTMLElement | null>(null)
+const commLogDockPre = ref<HTMLElement | null>(null)
+
+function scrollPreToBottom(el: HTMLElement | null) {
+  if (!el) return
+  requestAnimationFrame(() => {
+    el.scrollTop = el.scrollHeight
+  })
+}
+
+watch(
+  videoLog,
+  async () => {
+    await nextTick()
+    scrollPreToBottom(videoYtdlpLogPre.value)
+  },
+  { flush: 'post' },
+)
+
 function onVideoDownloadModalClose() {
   if (videoRunning.value) void cancelVideoDownload()
   closeVideoDownloadModal()
+}
+
+const {
+  btTorrentModalOpen,
+  btParsed,
+  btParseError,
+  btTorrentHref,
+  btTorrentPathLabel,
+  btOutputDir,
+  btBusy,
+  openBtTorrentModal,
+  closeBtTorrentModal,
+  pickBtTorrentFile,
+  pickBtTorrentOutputDir,
+} = useBtTorrentModal()
+
+const btAria2Available = ref<boolean | null>(null)
+const btAria2Via = ref('')
+
+async function refreshBtAria2() {
+  const shell = window.anyDownloaderShell
+  if (!shell?.checkAria2) {
+    btAria2Available.value = false
+    btAria2Via.value = ''
+    return
+  }
+  try {
+    const r = await shell.checkAria2(true)
+    btAria2Available.value = r?.available ?? false
+    btAria2Via.value = typeof r?.via === 'string' ? r.via : ''
+  } catch {
+    btAria2Available.value = false
+    btAria2Via.value = ''
+  }
+}
+
+watch(btTorrentModalOpen, (o) => {
+  if (o) void refreshBtAria2()
+})
+
+function openBtTorrentModalSafe() {
+  if (typeof window === 'undefined' || !window.anyDownloaderShell?.pickTorrentFile) {
+    notify('warn', strings.value.errNeedBackend)
+    return
+  }
+  openBtTorrentModal()
+}
+
+async function btTorrentEnqueue(startNow: boolean) {
+  const href = btTorrentHref.value
+  const parsed = btParsed.value
+  const dir = btOutputDir.value?.trim()
+  if (!href || !parsed) {
+    notify('warn', strings.value.btTorrentNeedParse)
+    return
+  }
+  if (!dir) {
+    notify('warn', strings.value.btTorrentNeedDir)
+    return
+  }
+  const shell = window.anyDownloaderShell
+  const chk = await shell?.checkAria2?.(false)
+  if (!chk?.available) {
+    notify('error', strings.value.errAria2Missing)
+    return
+  }
+  const det = detectProtocol(href)
+  if (!det || det.protocol !== 'file') {
+    notify('error', strings.value.btTorrentInvalidHref)
+    return
+  }
+  try {
+    const u = new URL(det.href)
+    if (!/\.torrent$/i.test(u.pathname)) {
+      notify('error', strings.value.btTorrentInvalidHref)
+      return
+    }
+  } catch {
+    notify('error', strings.value.btTorrentInvalidHref)
+    return
+  }
+  const saveName = `${parsed.name}.torrent`
+  const before = tasks.length
+  enqueueTask(det, { fileName: saveName, handle: null, electronOutputDir: dir })
+  if (tasks.length === before) {
+    notify('warn', strings.value.errEnqueueNone)
+    return
+  }
+  const added = tasks[tasks.length - 1]!
+  closeBtTorrentModal()
+  const msg = (startNow ? strings.value.addDoneStarted : strings.value.addDoneQueued).replace('{n}', '1')
+  notify('info', msg)
+  if (startNow) {
+    void startTask(added.id, strings.value.errNeedBackend, strings.value.errCors)
+  }
 }
 
 function runElectronVideoDownload() {
@@ -121,11 +256,21 @@ const {
   clearDoneTasks,
   pauseTask,
   setTaskThreadOverride,
+  enforceConcurrencyLimit,
+  clearAllResumeIdb,
 } = useDownloads()
 const { mode: threadMode, manualCount } = useDownloadThreads()
 const { taskConcurrencyMode, maxConcurrentTasksManual, pressureStrategy } = useDownloadPolicy()
 
 const concurrentLimit = computed(() => effectiveMaxConcurrentTasks())
+
+const bufferIdbDescText = computed(() =>
+  tMsg('bufferIdbDesc', { db: IDB_RESUME_DB_NAME, store: IDB_RESUME_STORE }),
+)
+
+function onEnforceParallelPolicy() {
+  enforceConcurrencyLimit({ notify: true })
+}
 const { running: speedRunning, regions, uploadMbps, uploadError, lastError, runAll, setRegionLabels } = useSpeedTest()
 
 const logOpen = ref(false)
@@ -134,6 +279,8 @@ const aboutOpen = ref(false)
 const methodsOpen = ref(false)
 const pageModalOpen = ref(false)
 const addModalOpen = ref(false)
+/** 从文件导入前先展示说明，再打开系统文件选择器 */
+const addImportHintOpen = ref(false)
 const addPasteText = ref('')
 const addModalTa = ref<HTMLTextAreaElement | null>(null)
 interface AddParsedRow {
@@ -145,6 +292,10 @@ interface AddParsedRow {
   selected: boolean
 }
 const addParsedRows = ref<AddParsedRow[]>([])
+/** 批量 http(s) 且存在公共路径前缀时，在保存目录下按 URL 子路径建子文件夹 */
+const addPreserveRelativePath = ref(false)
+/** 网页导入：所选同站多条直链时保留相对路径 */
+const pagePreserveRelativePath = ref(false)
 
 /** 列表渲染上限，避免单页百万行拖垮 DOM */
 const MAX_ADD_MODAL_URLS = 25_000
@@ -181,14 +332,45 @@ const pageDirDisplayLine = computed(() => {
 
 const pageDirBrowserOnlyNameHint = computed(() => !!(pageDirHandle.value && !pageDirFullPath.value))
 
-/** Electron：上次选择的网页导入目录，关闭弹窗/重启应用后仍保留 */
-const PAGE_IMPORT_DIR_STORAGE_KEY = 'any-downloader-page-import-dir'
+const addCanPreserveDir = computed(() => {
+  const hrefs = addParsedRows.value
+    .filter((r) => r.canEnqueue && r.det && ['http', 'https', 'blob'].includes(r.det.protocol))
+    .map((r) => r.det!.href)
+  return hrefs.length >= 2 && computeHttpBatchDirPrefix(hrefs) != null
+})
 
+const pageCanPreserveDir = computed(() => {
+  const hrefs = pageRichLinks.value.filter((r) => r.canTryHttpDownload).map((r) => r.url)
+  return hrefs.length >= 2 && computeHttpBatchDirPrefix(hrefs) != null
+})
+
+function isFileTorrentProtocol(det: ProtocolDetectResult | null): boolean {
+  if (!det || det.protocol !== 'file') return false
+  try {
+    return /\.torrent$/i.test(new URL(det.href).pathname)
+  } catch {
+    return /\.torrent$/i.test(det.href)
+  }
+}
+
+function rowNeedsBtEngine(row: AddParsedRow): boolean {
+  if (!row.det) return false
+  if (row.det.protocol === 'magnet') return true
+  return isFileTorrentProtocol(row.det)
+}
+
+function rowIsHttpEnqueue(row: AddParsedRow): boolean {
+  const d = row.det
+  if (!d) return false
+  return ['http', 'https', 'blob'].includes(d.protocol)
+}
+
+/** Electron：上次选择的网页导入目录，关闭弹窗/重启应用后仍保留 */
 function loadPersistedPageImportDir() {
   if (typeof localStorage === 'undefined') return
   try {
     if (!window.anyDownloaderShell) return
-    const raw = localStorage.getItem(PAGE_IMPORT_DIR_STORAGE_KEY)
+    const raw = localStorage.getItem(APP_STORAGE_KEYS.PAGE_IMPORT_DIR)
     const p = raw?.trim()
     if (p) pageDirFullPath.value = p
   } catch {
@@ -200,7 +382,7 @@ function persistPageImportDir(path: string) {
   if (typeof localStorage === 'undefined') return
   try {
     if (!window.anyDownloaderShell) return
-    localStorage.setItem(PAGE_IMPORT_DIR_STORAGE_KEY, path.trim())
+    localStorage.setItem(APP_STORAGE_KEYS.PAGE_IMPORT_DIR, path.trim())
   } catch {
     /* ignore */
   }
@@ -253,10 +435,10 @@ function togglePageKindSelection(kind: PageResourceKind) {
   for (const r of rows) pageSelected[r.url] = v
 }
 
-type LeftDockKey = 'speed' | 'global'
+type LeftDockKey = 'speed' | 'global' | 'buffers' | 'analysis'
 type RightDockKey = 'info' | 'chunks' | 'comm'
 
-const leftDockPanel = ref({ speed: false, global: true })
+const leftDockPanel = ref({ speed: false, global: true, buffers: false, analysis: false })
 const rightDockPanel = ref({ info: true, chunks: true, comm: true })
 const leftDockMax = ref<LeftDockKey | null>(null)
 const rightDockMax = ref<RightDockKey | null>(null)
@@ -265,7 +447,13 @@ const ctx = ref<{ x: number; y: number; taskId: string } | null>(null)
 
 const taskThreadInput = ref('')
 
-const leftDockExpanded = computed(() => leftDockPanel.value.speed || leftDockPanel.value.global)
+const leftDockExpanded = computed(
+  () =>
+    leftDockPanel.value.speed ||
+    leftDockPanel.value.global ||
+    leftDockPanel.value.buffers ||
+    leftDockPanel.value.analysis,
+)
 const rightDockExpanded = computed(
   () => rightDockPanel.value.info || rightDockPanel.value.chunks || rightDockPanel.value.comm,
 )
@@ -297,6 +485,19 @@ const commLogPanelText = computed(() => {
   if (!lines?.length) return strings.value.dockCommEmptyNoLog
   return lines.join('\n')
 })
+
+watch(
+  [
+    commLogPanelText,
+    () => selectedTask.value?.id,
+    () => taskCommLogs[selectedTask.value?.id ?? '']?.length ?? 0,
+  ],
+  async () => {
+    await nextTick()
+    scrollPreToBottom(commLogDockPre.value)
+  },
+  { flush: 'post' },
+)
 
 const catalogLocale = computed(() => (locale.value === 'zh' ? 'zh' : 'en'))
 
@@ -377,13 +578,10 @@ function formatDurationSec(sec: number): string {
 }
 
 function formatTaskElapsed(t: DownloadTask): string {
-  if (t.runStartedAt == null) return strings.value.timeNA
-  if (t.status === 'done' || t.status === 'error') {
-    const end = t.runFinishedAt ?? Date.now()
-    return formatDurationSec((end - t.runStartedAt) / 1000)
-  }
   void uiTick.value
-  return formatDurationSec((Date.now() - t.runStartedAt) / 1000)
+  const ms = taskActiveElapsedMs(t)
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return strings.value.timeNA
+  return formatDurationSec(ms / 1000)
 }
 
 function formatTaskEta(t: DownloadTask): string {
@@ -418,6 +616,190 @@ const diskSparkLive = computed(() => {
   void uiTick.value
   return `${strings.value.sparkCurrentDisk}: ${formatBytes(sessionIoStats.writeBps)}/s`
 })
+
+const bufferLsRows = ref<LocalStorageRow[]>([])
+const idbPartialCount = ref(0)
+const diagnosticText = ref('')
+let diagnosticTimer: ReturnType<typeof setInterval> | null = null
+
+async function refreshBufferInventory() {
+  bufferLsRows.value = listAppLocalStorageRows()
+  try {
+    idbPartialCount.value = await idbCountPartials()
+  } catch {
+    idbPartialCount.value = 0
+  }
+}
+
+function labelForAppStorageKey(key: AppStorageKey): string {
+  const m: Record<string, string> = {
+    [APP_STORAGE_KEYS.TASK_LIST]: strings.value.bufferKeyTaskList,
+    [APP_STORAGE_KEYS.THEME]: strings.value.bufferKeyTheme,
+    [APP_STORAGE_KEYS.THREAD_MODE]: strings.value.bufferKeyThreadMode,
+    [APP_STORAGE_KEYS.THREAD_MANUAL]: strings.value.bufferKeyThreadManual,
+    [APP_STORAGE_KEYS.CONCURRENCY_MODE]: strings.value.bufferKeyConcurrencyMode,
+    [APP_STORAGE_KEYS.CONCURRENCY_MAX]: strings.value.bufferKeyConcurrencyMax,
+    [APP_STORAGE_KEYS.PRESSURE]: strings.value.bufferKeyPressure,
+    [APP_STORAGE_KEYS.PAGE_IMPORT_DIR]: strings.value.bufferKeyPageImport,
+  }
+  return m[key] ?? key
+}
+
+function clearUiChartBuffers() {
+  globalSpeedHistory.value = []
+  diskWriteHistory.value = []
+}
+
+function rebuildDiagnostics() {
+  const perfMem =
+    typeof performance !== 'undefined' && 'memory' in performance
+      ? (performance as unknown as { memory: { usedJSHeapSize: number; totalJSHeapSize: number; jsHeapSizeLimit: number } })
+          .memory
+      : undefined
+  const hist: Record<string, number> = {}
+  for (const t of tasks) {
+    const r = t.singleConnReason ?? 'none'
+    hist[r] = (hist[r] ?? 0) + 1
+  }
+  const nav = typeof navigator !== 'undefined' ? navigator : undefined
+  const dm =
+    nav && 'deviceMemory' in nav ? (nav as unknown as { deviceMemory?: number }).deviceMemory : undefined
+  diagnosticText.value = formatDiagnosticsReport({
+    generatedAt: new Date().toISOString(),
+    navigator: {
+      userAgent: nav?.userAgent ?? '',
+      language: nav?.language ?? '',
+      hardwareConcurrency: nav?.hardwareConcurrency,
+      deviceMemory: dm,
+      onLine: nav?.onLine ?? true,
+    },
+    jsHeap: perfMem
+      ? {
+          usedJSHeapSize: perfMem.usedJSHeapSize,
+          totalJSHeapSize: perfMem.totalJSHeapSize,
+          jsHeapSizeLimit: perfMem.jsHeapSizeLimit,
+        }
+      : undefined,
+    policy: {
+      taskConcurrencyMode: taskConcurrencyMode.value,
+      maxConcurrentTasksManual: maxConcurrentTasksManual.value,
+      pressureStrategy: pressureStrategy.value,
+      effectiveMaxConcurrentTasks: effectiveMaxConcurrentTasks(),
+    },
+    threads: {
+      mode: threadMode.value,
+      manualCount: manualCount.value,
+      pressureConnectionMultiplier: pressureConnectionMultiplier(),
+    },
+    sessionDownloadInfo: {
+      connectionKind: sessionDownloadInfo.connectionKind,
+      activeThreads: sessionDownloadInfo.activeThreads,
+      bottleneck: sessionDownloadInfo.bottleneck,
+    },
+    tasks: {
+      total: tasks.length,
+      running: tasks.filter((t) => t.status === 'running').length,
+      queued: tasks.filter((t) => t.status === 'queued').length,
+      paused: tasks.filter((t) => t.status === 'paused').length,
+      done: tasks.filter((t) => t.status === 'done').length,
+      error: tasks.filter((t) => t.status === 'error').length,
+    },
+    singleConnReasonHistogram: hist,
+    speedTest: { lastError: lastError.value, regionsCount: regions.length },
+    buffers: {
+      logLineCount: lines.value.length,
+      globalSpeedSamples: globalSpeedHistory.value.length,
+      diskWriteSamples: diskWriteHistory.value.length,
+    },
+  })
+}
+
+async function onClearAppStorageKey(key: AppStorageKey) {
+  if (key === APP_STORAGE_KEYS.TASK_LIST) {
+    if (!window.confirm(strings.value.bufferConfirmClearTasks)) return
+    removeAllTasks()
+    await refreshBufferInventory()
+    notify('info', strings.value.bufferClearedTasks)
+    return
+  }
+  clearAppLocalStorageKey(key)
+  if (key === APP_STORAGE_KEYS.THEME) syncThemeFromStorage()
+  else if (
+    key === APP_STORAGE_KEYS.CONCURRENCY_MODE ||
+    key === APP_STORAGE_KEYS.CONCURRENCY_MAX ||
+    key === APP_STORAGE_KEYS.PRESSURE
+  ) {
+    reloadPolicyFromStorage()
+  } else if (key === APP_STORAGE_KEYS.THREAD_MODE || key === APP_STORAGE_KEYS.THREAD_MANUAL) {
+    reloadThreadSettingsFromStorage()
+  } else if (key === APP_STORAGE_KEYS.PAGE_IMPORT_DIR) {
+    pageDirFullPath.value = null
+    pageDirHandle.value = null
+  }
+  await refreshBufferInventory()
+  notify('info', strings.value.bufferClearedOne)
+}
+
+async function onClearIdbResume() {
+  try {
+    await clearAllResumeIdb()
+    idbPartialCount.value = await idbCountPartials()
+    notify('info', strings.value.bufferClearedIdb)
+  } catch (e) {
+    notify('error', `${strings.value.bufferClearIdbFailed}: ${(e as Error).message}`)
+  }
+}
+
+async function wipeAllLocalAppData() {
+  if (!window.confirm(strings.value.bufferConfirmWipeAll)) return
+  pauseAll()
+  removeAllTasks()
+  clearLogLines()
+  clearUiChartBuffers()
+  try {
+    await clearAllResumeIdb()
+  } catch {
+    /* ignore */
+  }
+  clearAllKnownAppLocalStorage()
+  pageDirFullPath.value = null
+  pageDirHandle.value = null
+  syncThemeFromStorage()
+  reloadPolicyFromStorage()
+  reloadThreadSettingsFromStorage()
+  await refreshBufferInventory()
+  notify('warn', strings.value.bufferWipedNotify, { persist: true })
+}
+
+async function copyDiagnosticsJson() {
+  try {
+    await navigator.clipboard.writeText(diagnosticText.value)
+    notify('info', strings.value.diagCopied)
+  } catch {
+    notify('warn', strings.value.diagCopyFailed)
+  }
+}
+
+watch(
+  () => leftDockPanel.value.buffers && leftDockExpanded.value,
+  (on) => {
+    if (on) void refreshBufferInventory()
+  },
+)
+
+watch(
+  () => leftDockPanel.value.analysis && leftDockExpanded.value,
+  (on) => {
+    if (diagnosticTimer != null) {
+      clearInterval(diagnosticTimer)
+      diagnosticTimer = null
+    }
+    if (on) {
+      rebuildDiagnostics()
+      diagnosticTimer = setInterval(rebuildDiagnostics, 2000)
+    }
+  },
+)
 
 const taskSparkLive = computed(() => {
   void uiTick.value
@@ -488,10 +870,18 @@ function pageLinkHint(row: RichPageLink): string {
 function addModalRowHint(row: AddParsedRow): string {
   if (!row.det || row.det.protocol === 'unknown') return strings.value.linkUnknownProto
   const p = row.det.protocol
+  if (p === 'magnet') {
+    return window.anyDownloaderShell?.isElectron
+      ? strings.value.linkHintAria2Electron
+      : strings.value.linkHintNeedEngine
+  }
+  if (isFileTorrentProtocol(row.det)) {
+    return window.anyDownloaderShell?.isElectron
+      ? strings.value.linkHintAria2Electron
+      : strings.value.linkHintNeedEngine
+  }
   if (
-    ['magnet', 'ed2k', 'thunder', 'flashget', 'qqdl', 'ftp', 'ftps', 'sftp', 's3', 'dav', 'davs', 'ws', 'wss'].includes(
-      p,
-    )
+    ['ed2k', 'thunder', 'flashget', 'qqdl', 'ftp', 'ftps', 'sftp', 's3', 'dav', 'davs', 'ws', 'wss'].includes(p)
   )
     return strings.value.linkHintNeedEngine
   if (row.kind === 'hls') return strings.value.linkHintHls
@@ -531,7 +921,13 @@ function makeAddParsedRow(raw: string, i: number): AddParsedRow {
   const { kind } = classifyDownloadUrl(href)
   const protoOk = det != null && det.protocol !== 'unknown'
   const httpFamily = det != null && ['http', 'https', 'blob', 'data'].includes(det.protocol)
-  const canEnqueue = !!(protoOk && httpFamily && kind !== 'embed_page' && kind !== 'hls' && kind !== 'dash')
+  const isElectron = typeof window !== 'undefined' && !!window.anyDownloaderShell?.isElectron
+  const magnetOk = det != null && det.protocol === 'magnet' && isElectron
+  const torrentFileOk = isFileTorrentProtocol(det) && isElectron
+  const canEnqueue = !!(
+    protoOk &&
+    ((httpFamily && kind !== 'embed_page' && kind !== 'hls' && kind !== 'dash') || magnetOk || torrentFileOk)
+  )
   return {
     id: `p-${i}`,
     raw,
@@ -626,7 +1022,17 @@ async function onAddImportFileChange(ev: Event) {
 }
 
 function openAddImportFilePicker() {
-  addImportFileInput.value?.click()
+  if (importFileBusy.value) return
+  addImportHintOpen.value = true
+}
+
+function confirmAddImportFilePicker() {
+  addImportHintOpen.value = false
+  void nextTick(() => addImportFileInput.value?.click())
+}
+
+function cancelAddImportFileHint() {
+  addImportHintOpen.value = false
 }
 
 function addSelectAllOk() {
@@ -645,8 +1051,30 @@ async function enqueueAddModalSelections(startNow: boolean) {
     notify('warn', strings.value.addNoSelection)
     return
   }
+  const shell = typeof window !== 'undefined' ? window.anyDownloaderShell : undefined
+  const hasBt = rows.some((r) => rowNeedsBtEngine(r))
+
+  if (hasBt && !shell?.pickImportDirectory) {
+    notify('error', strings.value.errBtElectronOnly)
+    return
+  }
+
+  let electronDir: string | null = null
   let dir: FileSystemDirectoryHandle | null = null
-  if (rows.length > 1) {
+
+  if (hasBt) {
+    try {
+      const picked = await shell!.pickImportDirectory!()
+      electronDir = picked?.path?.trim() || null
+    } catch (e) {
+      notify('error', `${strings.value.errDirPicker}: ${(e as Error).message}`)
+      return
+    }
+    if (!electronDir) {
+      notify('warn', strings.value.pageDirRequired)
+      return
+    }
+  } else if (rows.length > 1) {
     try {
       dir = await pickSaveDirectory()
     } catch (e) {
@@ -658,29 +1086,40 @@ async function enqueueAddModalSelections(startNow: boolean) {
       return
     }
   }
+
+  const httpHrefs = rows.filter((r) => rowIsHttpEnqueue(r)).map((r) => r.det!.href)
+  const batchPrefix =
+    addPreserveRelativePath.value && httpHrefs.length >= 2 ? computeHttpBatchDirPrefix(httpHrefs) : null
+
   const before = tasks.length
   for (const row of rows) {
     const det = row.det!
-    const name = guessNameFromUrl(det.href)
-    let save: SavePickResult | null = null
-    if (dir) {
-      try {
-        const h = await dir.getFileHandle(name, { create: true })
-        save = { fileName: name, handle: h }
-      } catch (e) {
-        const msg = `${name}: ${(e as Error).message}`
-        log('error', msg)
-        notify('error', msg)
-        continue
-      }
-    } else {
-      save = await pickSaveLocation(name)
-      if (!save) {
-        notify('warn', strings.value.errSaveCancelled)
-        return
-      }
+    let saveName = guessNameFromUrl(det.href)
+    if (batchPrefix && rowIsHttpEnqueue(row)) {
+      saveName = sanitizeRelativeSavePath(relativeFilePathUnderUrlPrefix(det.href, batchPrefix))
     }
-    enqueueTask(det, save)
+    let save: SavePickResult | null = null
+    try {
+      if (electronDir) {
+        save = { fileName: saveName, handle: null, electronOutputDir: electronDir }
+      } else if (dir) {
+        const h = await getOrCreateFileHandleInDirectory(dir, saveName)
+        save = { fileName: saveName, handle: h }
+      } else {
+        const leaf = saveName.includes('/') ? saveName.split('/').pop()! : saveName
+        save = await pickSaveLocation(leaf)
+        if (!save) {
+          notify('warn', strings.value.errSaveCancelled)
+          return
+        }
+      }
+    } catch (e) {
+      const msg = `${saveName}: ${(e as Error).message}`
+      log('error', msg)
+      notify('error', msg)
+      continue
+    }
+    enqueueTask(det, save!)
   }
   if (tasks.length === before) {
     notify('warn', strings.value.errEnqueueNone)
@@ -742,6 +1181,15 @@ async function onCopyLog() {
   const ok = await copyAll()
   if (ok) notify('info', strings.value.logCopiedOk)
   else notify('error', strings.value.errClipboardCopyLog)
+}
+
+async function onCopyCommLog() {
+  try {
+    await navigator.clipboard.writeText(commLogPanelText.value)
+    notify('info', strings.value.dockCommCopyOk)
+  } catch {
+    notify('error', strings.value.errClipboardCopyLog)
+  }
 }
 
 function onSplitLeftDown(e: MouseEvent) {
@@ -952,22 +1400,33 @@ async function addSelectedFromPage(startNow: boolean) {
     notify('warn', strings.value.pageDirRequired)
     return
   }
+  const selectedUrls = pageRichLinks.value
+    .filter((r) => pageSelected[r.url] && r.canTryHttpDownload)
+    .map((r) => r.url)
+  const batchPrefix =
+    pagePreserveRelativePath.value && selectedUrls.length >= 2
+      ? computeHttpBatchDirPrefix(selectedUrls)
+      : null
+
   const before = tasks.length
   for (const row of pageRichLinks.value) {
     if (!pageSelected[row.url] || !row.canTryHttpDownload) continue
     const det = detectProtocol(row.url)
     if (!det || det.protocol === 'unknown') continue
     if (!['http', 'https', 'blob', 'data'].includes(det.protocol)) continue
-    const name = guessNameFromUrl(det.href)
+    let saveName = guessNameFromUrl(det.href)
+    if (batchPrefix) {
+      saveName = sanitizeRelativeSavePath(relativeFilePathUnderUrlPrefix(det.href, batchPrefix))
+    }
     try {
       if (electronDir) {
-        enqueueTask(det, { fileName: name, handle: null, electronOutputDir: electronDir })
+        enqueueTask(det, { fileName: saveName, handle: null, electronOutputDir: electronDir })
       } else {
-        const handle = await dir!.getFileHandle(name, { create: true })
-        enqueueTask(det, { fileName: name, handle })
+        const handle = await getOrCreateFileHandleInDirectory(dir!, saveName)
+        enqueueTask(det, { fileName: saveName, handle })
       }
     } catch (e) {
-      const msg = `${name}: ${(e as Error).message}`
+      const msg = `${saveName}: ${(e as Error).message}`
       log('error', msg)
       notify('error', msg)
     }
@@ -1044,6 +1503,10 @@ onUnmounted(() => {
   if (globalAggregateTimer != null) {
     clearInterval(globalAggregateTimer)
     globalAggregateTimer = null
+  }
+  if (diagnosticTimer != null) {
+    clearInterval(diagnosticTimer)
+    diagnosticTimer = null
   }
 })
 </script>
@@ -1123,6 +1586,9 @@ onUnmounted(() => {
             >
               {{ strings.menuVideoDownload }}
             </button>
+            <button v-if="isElectron" type="button" class="menu-item" @click="openBtTorrentModalSafe">
+              {{ strings.menuBtTorrent }}
+            </button>
             <button type="button" class="menu-item" @click="void startAll(strings.errNeedBackend, strings.errCors)">
               {{ strings.toolbarAllStart }}
             </button>
@@ -1152,6 +1618,8 @@ onUnmounted(() => {
           <div class="menu-dropdown">
             <button type="button" class="menu-item" @click="toggleLeftDock('speed')">{{ strings.winDockLeftSpeed }}</button>
             <button type="button" class="menu-item" @click="toggleLeftDock('global')">{{ strings.winDockGlobal }}</button>
+            <button type="button" class="menu-item" @click="toggleLeftDock('buffers')">{{ strings.winDockBuffers }}</button>
+            <button type="button" class="menu-item" @click="toggleLeftDock('analysis')">{{ strings.winDockAnalysis }}</button>
             <button type="button" class="menu-item" @click="toggleRightDock('info')">{{ strings.winDockInfo }}</button>
             <button type="button" class="menu-item" @click="toggleRightDock('chunks')">{{ strings.winDockChunks }}</button>
             <button type="button" class="menu-item" @click="toggleRightDock('comm')">{{ strings.winDockCommLog }}</button>
@@ -1209,6 +1677,16 @@ onUnmounted(() => {
         @click="openVideoDownloadModal"
       >
         🎬
+      </button>
+      <button
+        v-if="isElectron"
+        type="button"
+        class="tb-btn tb-icon"
+        :aria-label="strings.toolbarBtTorrent"
+        :title="strings.toolbarBtTorrent"
+        @click="openBtTorrentModalSafe"
+      >
+        🧲
       </button>
       <span class="tb-sep" />
       <button
@@ -1268,6 +1746,24 @@ onUnmounted(() => {
             @click="toggleLeftDock('global')"
           >
             ◉
+          </button>
+          <button
+            type="button"
+            class="dock-btn"
+            :class="{ active: leftDockPanel.buffers }"
+            :title="strings.winDockBuffers"
+            @click="toggleLeftDock('buffers')"
+          >
+            🗄
+          </button>
+          <button
+            type="button"
+            class="dock-btn"
+            :class="{ active: leftDockPanel.analysis }"
+            :title="strings.winDockAnalysis"
+            @click="toggleLeftDock('analysis')"
+          >
+            📊
           </button>
         </div>
         <div v-show="leftDockExpanded" id="dock-view-left" class="dock-view">
@@ -1412,6 +1908,25 @@ onUnmounted(() => {
                 <span v-else-if="pressureStrategy === 'max'">{{ strings.pressureMaxHint }}</span>
                 <span v-else>{{ strings.pressureBalancedHint }}</span>
               </p>
+              <p class="muted small policy-hint-block">{{ strings.policyHintSaved }}</p>
+              <p class="muted small policy-hint-block">{{ strings.policyHintConcurrency }}</p>
+              <p class="muted small policy-hint-block">{{ strings.policyHintThreads }}</p>
+              <p class="policy-effective-row">
+                <span
+                  ><strong>{{ strings.policyEffectiveLabel }}</strong> {{ concurrentLimit }} ·
+                  <strong>{{ strings.policyRunningLabel }}</strong> {{ runningDownloadCount }}</span
+                >
+              </p>
+              <p class="policy-enforce-row">
+                <button
+                  type="button"
+                  class="tb-btn"
+                  :title="strings.policyEnforceTitle"
+                  @click="onEnforceParallelPolicy"
+                >
+                  {{ strings.policyEnforceBtn }}
+                </button>
+              </p>
               <p>
                 <strong>{{ strings.threadPolicy }}</strong><br />
                 <label class="inline-label"><input v-model="threadMode" type="radio" value="auto" /> {{ strings.threadAuto }}</label>
@@ -1421,6 +1936,100 @@ onUnmounted(() => {
                 <label>{{ strings.threadCountLabel }}</label>
                 <input v-model.number="manualCount" class="thread-inp" type="number" min="1" max="16" />
               </p>
+            </div>
+          </section>
+
+          <section
+            v-show="leftDockPanel.buffers && (!leftDockMax || leftDockMax === 'buffers')"
+            class="dock-card"
+            :class="{ 'dock-card-max': leftDockMax === 'buffers' }"
+          >
+            <header class="dock-head">
+              <span>{{ strings.winDockBuffers }}</span>
+              <div class="dock-head-actions">
+                <button
+                  type="button"
+                  class="dock-max"
+                  :title="leftDockMax === 'buffers' ? strings.dockRestore : strings.dockMaximize"
+                  @click.stop="toggleLeftMax('buffers')"
+                >
+                  {{ leftDockMax === 'buffers' ? '⤓' : '⛶' }}
+                </button>
+                <button type="button" class="dock-fold" :title="strings.noShortcut" @click="toggleLeftDock('buffers')">
+                  ▾
+                </button>
+              </div>
+            </header>
+            <div class="dock-body dock-body-buffers">
+              <p class="muted small">{{ strings.bufferIntro }}</p>
+              <p>
+                <strong>{{ strings.bufferSectionLs }}</strong>
+              </p>
+              <ul class="buffer-ls-list">
+                <li v-for="row in bufferLsRows" :key="row.key" class="buffer-ls-item">
+                  <span class="buffer-ls-label">{{ labelForAppStorageKey(row.key) }}</span>
+                  <span class="buffer-ls-meta mono">{{ row.bytes }} B</span>
+                  <button type="button" class="tb-btn buffer-ls-clear" @click="void onClearAppStorageKey(row.key)">
+                    {{ strings.bufferClearRow }}
+                  </button>
+                </li>
+              </ul>
+              <p>
+                <strong>{{ strings.bufferSectionIdb }}</strong><br />
+                <span class="small">{{ bufferIdbDescText }}</span><br />
+                <span class="mono">{{ strings.bufferIdbRecords }} {{ idbPartialCount }}</span>
+              </p>
+              <p class="buffer-actions">
+                <button type="button" class="tb-btn" @click="void refreshBufferInventory()">{{ strings.bufferRefresh }}</button>
+                <button type="button" class="tb-btn" @click="void onClearIdbResume()">{{ strings.bufferClearIdb }}</button>
+              </p>
+              <p>
+                <strong>{{ strings.bufferSectionMemory }}</strong>
+              </p>
+              <ul class="buffer-mem-list small">
+                <li>{{ strings.bufferMemLog }}: {{ lines.length }}</li>
+                <li>{{ strings.bufferMemSpark }}: {{ globalSpeedHistory.length }} / {{ diskWriteHistory.length }}</li>
+                <li>{{ strings.bufferMemTasks }}: {{ tasks.length }}</li>
+              </ul>
+              <p class="buffer-actions">
+                <button type="button" class="tb-btn" @click="clearLogLines">{{ strings.bufferClearLog }}</button>
+                <button type="button" class="tb-btn" @click="clearUiChartBuffers">{{ strings.bufferClearCharts }}</button>
+              </p>
+              <p class="buffer-actions buffer-actions-danger">
+                <button type="button" class="tb-btn danger-btn" @click="void wipeAllLocalAppData()">
+                  {{ strings.bufferWipeAll }}
+                </button>
+              </p>
+            </div>
+          </section>
+
+          <section
+            v-show="leftDockPanel.analysis && (!leftDockMax || leftDockMax === 'analysis')"
+            class="dock-card dock-card-analysis"
+            :class="{ 'dock-card-max': leftDockMax === 'analysis' }"
+          >
+            <header class="dock-head">
+              <span>{{ strings.winDockAnalysis }}</span>
+              <div class="dock-head-actions">
+                <button
+                  type="button"
+                  class="dock-max"
+                  :title="leftDockMax === 'analysis' ? strings.dockRestore : strings.dockMaximize"
+                  @click.stop="toggleLeftMax('analysis')"
+                >
+                  {{ leftDockMax === 'analysis' ? '⤓' : '⛶' }}
+                </button>
+                <button type="button" class="dock-fold" :title="strings.noShortcut" @click="toggleLeftDock('analysis')">
+                  ▾
+                </button>
+              </div>
+            </header>
+            <div class="dock-body dock-body-analysis">
+              <p class="muted small">{{ strings.diagIntro }}</p>
+              <p class="buffer-actions">
+                <button type="button" class="tb-btn" @click="copyDiagnosticsJson">{{ strings.diagCopyJson }}</button>
+              </p>
+              <pre class="diag-pre mono" tabindex="0">{{ diagnosticText }}</pre>
             </div>
           </section>
         </div>
@@ -1593,7 +2202,8 @@ onUnmounted(() => {
             </header>
             <div class="dock-body">
               <p class="muted small">{{ strings.chunkHint }}</p>
-              <div v-if="selectedTask" class="chunk-legend">
+              <p v-if="selectedTask" class="muted small chunk-legend-intro">{{ strings.chunkLegendIntro }}</p>
+              <div v-if="selectedTask" class="chunk-legend" aria-label="chunk color legend">
                 <span class="lg chunk-done">{{ strings.chunkLegendDone }}</span>
                 <span class="lg chunk-active">{{ strings.chunkLegendActive }}</span>
                 <span class="lg chunk-paused">{{ strings.chunkLegendPaused }}</span>
@@ -1627,6 +2237,14 @@ onUnmounted(() => {
               <div class="dock-head-actions">
                 <button
                   type="button"
+                  class="dock-btn-text"
+                  :title="strings.dockCommCopy"
+                  @click.stop="void onCopyCommLog()"
+                >
+                  {{ strings.dockCommCopy }}
+                </button>
+                <button
+                  type="button"
                   class="dock-max"
                   :title="rightDockMax === 'comm' ? strings.dockRestore : strings.dockMaximize"
                   @click.stop="toggleRightMax('comm')"
@@ -1640,7 +2258,7 @@ onUnmounted(() => {
             </header>
             <div class="dock-body dock-body-comm">
               <p class="muted small dock-comm-hint">{{ strings.dockCommHint }}</p>
-              <pre class="comm-log-pre comm-log-pre-dock" tabindex="0">{{ commLogPanelText }}</pre>
+              <pre ref="commLogDockPre" class="comm-log-pre comm-log-pre-dock" tabindex="0">{{ commLogPanelText }}</pre>
             </div>
           </section>
         </div>
@@ -1724,12 +2342,41 @@ onUnmounted(() => {
     </div>
 
     <div v-if="helpOpen" class="modal-backdrop" @click.self="helpOpen = false">
-      <div class="modal" role="dialog" aria-labelledby="help-h">
+      <div class="modal help-modal" role="dialog" aria-labelledby="help-h">
         <header class="modal-head">
           <h2 id="help-h">{{ strings.helpInfo }}</h2>
           <button type="button" class="icon-btn" @click="helpOpen = false">{{ strings.logClose }}</button>
         </header>
         <pre class="help-pre">{{ strings.helpText }}</pre>
+        <details class="help-advanced">
+          <summary>{{ strings.helpAdvancedSummary }}</summary>
+          <pre class="help-pre help-pre-advanced">{{ strings.helpAdvancedText }}</pre>
+        </details>
+      </div>
+    </div>
+
+    <div
+      v-if="addImportHintOpen"
+      class="modal-backdrop add-import-hint-backdrop"
+      role="presentation"
+      @click.self="cancelAddImportFileHint"
+    >
+      <div class="modal add-import-hint-modal" role="dialog" aria-labelledby="add-import-hint-h">
+        <header class="modal-head">
+          <h2 id="add-import-hint-h">{{ strings.addImportHintTitle }}</h2>
+          <button type="button" class="icon-btn" :title="strings.addImportHintClose" @click="cancelAddImportFileHint">
+            {{ strings.logClose }}
+          </button>
+        </header>
+        <div class="add-import-hint-body">
+          <p class="muted small add-import-hint-pre">{{ strings.addImportHintBody }}</p>
+          <div class="page-actions page-actions-footer">
+            <button type="button" class="tb-btn" @click="cancelAddImportFileHint">{{ strings.addImportHintClose }}</button>
+            <button type="button" class="tb-btn primary" @click="confirmAddImportFilePicker">
+              {{ strings.addImportHintChoose }}
+            </button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1841,6 +2488,11 @@ onUnmounted(() => {
                 </tr>
               </tbody>
             </table>
+            <label v-if="addCanPreserveDir" class="add-preserve-row muted small">
+              <input v-model="addPreserveRelativePath" type="checkbox" />
+              <span>{{ strings.addPreserveRelativePath }}</span>
+              <span class="add-preserve-hint"> — {{ strings.addPreserveRelativePathHint }}</span>
+            </label>
           </div>
           <div class="add-modal-actions add-modal-actions-bottom">
             <button
@@ -1887,8 +2539,24 @@ onUnmounted(() => {
           <p v-if="videoOutDir" class="small mono break">📁 {{ videoOutDir }}</p>
           <label class="page-label">{{ strings.videoDownloadUrlLabel }}</label>
           <input v-model="videoUrl" class="url-input page-url-inp" type="url" :disabled="videoRunning" />
+          <label class="page-label">{{ strings.videoYtdlpFormatLabel }}</label>
+          <select v-model="videoFormatPreset" class="url-input video-format-select" :disabled="videoRunning">
+            <option value="default">{{ strings.videoFormatDefault }}</option>
+            <option value="best">{{ strings.videoFormatBest }}</option>
+            <option value="2160">{{ strings.videoFormat2160 }}</option>
+            <option value="1440">{{ strings.videoFormat1440 }}</option>
+            <option value="1080">{{ strings.videoFormat1080 }}</option>
+            <option value="720">{{ strings.videoFormat720 }}</option>
+            <option value="480">{{ strings.videoFormat480 }}</option>
+            <option value="audio">{{ strings.videoFormatAudio }}</option>
+            <option value="worst">{{ strings.videoFormatWorst }}</option>
+          </select>
+          <label class="video-embed-subs-label">
+            <input v-model="videoEmbedSubs" type="checkbox" :disabled="videoRunning" />
+            <span>{{ strings.videoEmbedSubs }}</span>
+          </label>
           <p class="small muted">{{ strings.videoDownloadLogLabel }}</p>
-          <pre class="log-pre video-ytdlp-log">{{ videoLog || '—' }}</pre>
+          <pre ref="videoYtdlpLogPre" class="log-pre video-ytdlp-log">{{ videoLog || '—' }}</pre>
           <div class="page-actions page-actions-footer">
             <button
               type="button"
@@ -1900,6 +2568,75 @@ onUnmounted(() => {
             </button>
             <button type="button" class="tb-btn" :disabled="!videoRunning" @click="void cancelVideoDownload()">
               {{ strings.videoDownloadCancelOp }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div
+      v-if="btTorrentModalOpen && isElectron"
+      class="modal-backdrop"
+      role="presentation"
+      @click.self="closeBtTorrentModal"
+    >
+      <div class="modal page-modal" role="dialog" aria-labelledby="bt-torrent-h">
+        <header class="modal-head">
+          <h2 id="bt-torrent-h">{{ strings.btTorrentTitle }}</h2>
+          <button type="button" class="icon-btn" @click="closeBtTorrentModal">{{ strings.logClose }}</button>
+        </header>
+        <div class="page-body">
+          <p class="muted small">{{ strings.btTorrentHint }}</p>
+          <p v-if="btAria2Available === true" class="small video-ytdlp-status-ok">
+            {{ strings.btTorrentAria2Ok }}
+            <span v-if="btAria2Via" class="mono"> · {{ btAria2Via }}</span>
+          </p>
+          <p v-else-if="btAria2Available === false" class="small err-small">{{ strings.btTorrentAria2Missing }}</p>
+          <p v-else class="small muted">{{ strings.btTorrentRecheckAria2 }}…</p>
+          <div class="page-actions">
+            <button type="button" class="tb-btn" :disabled="btBusy" @click="void refreshBtAria2()">
+              {{ strings.btTorrentRecheckAria2 }}
+            </button>
+          </div>
+          <div class="page-actions">
+            <button type="button" class="tb-btn" :disabled="btBusy" @click="void pickBtTorrentFile()">
+              {{ strings.btTorrentPickFile }}
+            </button>
+            <button type="button" class="tb-btn" :disabled="btBusy" @click="void pickBtTorrentOutputDir()">
+              {{ strings.btTorrentPickDir }}
+            </button>
+          </div>
+          <p v-if="btTorrentPathLabel" class="small mono break">📄 {{ btTorrentPathLabel }}</p>
+          <p v-if="btParseError" class="small err-small">{{ btParseError }}</p>
+          <dl v-if="btParsed" class="bt-meta-dl small">
+            <dt>{{ strings.btTorrentMetaName }}</dt>
+            <dd>{{ btParsed.name }}</dd>
+            <dt>{{ strings.btTorrentMetaHash }}</dt>
+            <dd class="mono">{{ btParsed.infoHash }}</dd>
+            <dt>{{ strings.btTorrentMetaSize }}</dt>
+            <dd>{{ formatBytes(btParsed.length) }}</dd>
+            <dt>{{ strings.btTorrentMetaFiles }}</dt>
+            <dd>{{ btParsed.filesCount }}</dd>
+            <dt>{{ strings.btTorrentMetaAnnounce }}</dt>
+            <dd>{{ btParsed.announceCount }}</dd>
+          </dl>
+          <p v-if="btOutputDir" class="small mono break">📁 {{ btOutputDir }}</p>
+          <div class="page-actions page-actions-footer">
+            <button
+              type="button"
+              class="tb-btn primary"
+              :disabled="btBusy || !btParsed || !btOutputDir || btAria2Available === false"
+              @click="void btTorrentEnqueue(true)"
+            >
+              {{ strings.btTorrentStart }}
+            </button>
+            <button
+              type="button"
+              class="tb-btn"
+              :disabled="btBusy || !btParsed || !btOutputDir || btAria2Available === false"
+              @click="void btTorrentEnqueue(false)"
+            >
+              {{ strings.btTorrentQueue }}
             </button>
           </div>
         </div>
@@ -1934,6 +2671,10 @@ onUnmounted(() => {
               </template>
             </div>
           </div>
+          <label v-if="pageCanPreserveDir" class="page-preserve-row muted small">
+            <input v-model="pagePreserveRelativePath" type="checkbox" />
+            <span>{{ strings.pagePreserveRelativePath }}</span>
+          </label>
           <div class="page-actions page-actions-select-row">
             <button type="button" class="tb-btn" :disabled="pageFetchBusy" @click="pageSelectAll(true)">
               {{ strings.pageSelectAll }}

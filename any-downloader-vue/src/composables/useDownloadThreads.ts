@@ -1,7 +1,8 @@
 import { computed, ref, watch } from 'vue'
+import { APP_STORAGE_KEYS } from '../constants/appStorageKeys'
 
-const STORAGE_KEY = 'any-downloader-thread-mode'
-const STORAGE_MANUAL = 'any-downloader-thread-manual'
+const STORAGE_KEY = APP_STORAGE_KEYS.THREAD_MODE
+const STORAGE_MANUAL = APP_STORAGE_KEYS.THREAD_MANUAL
 
 export type ThreadMode = 'auto' | 'manual'
 
@@ -20,6 +21,11 @@ function load() {
 }
 
 load()
+
+/** 从 localStorage 重新加载线程模式与手动连接数 */
+export function reloadThreadSettingsFromStorage() {
+  load()
+}
 
 watch([mode, manualCount], () => {
   try {

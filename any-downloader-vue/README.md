@@ -68,6 +68,16 @@ python build.py --mac
 
 可在 `build-resources/` 放置 `icon.ico`（Windows）、`icon.icns`（macOS）、`icon.png`（Linux），并在 `package.json` 的 `build` 节配置 `icon`（参见 [electron-builder](https://www.electron.build/) 文档）。
 
+### Windows：内置 aria2（BT / 磁力）
+
+打 **Windows 安装包**（`--win` 或默认包含 NSIS）时，会先执行 `node scripts/fetch-aria2-win.cjs`，从 [aria2 官方 Release](https://github.com/aria2/aria2/releases) 拉取 **64 位 `aria2c.exe`** 到 `build-resources/aria2/`，再随安装包释放到 `resources/aria2/`（GPL-2.0+，同目录含 `COPYING`）。也可手动执行 `npm run fetch:aria2`。
+
+仅打 Linux/mac 且未包含 Windows 目标时**不会**下载 aria2。
+
+### Windows：内置 yt-dlp（视频下载）
+
+打 **Windows 安装包**且目标包含 `--win` 时，会执行 `node scripts/fetch-ytdlp-win.cjs`，从 [yt-dlp Releases](https://github.com/yt-dlp/yt-dlp/releases) 拉取 **`yt-dlp.exe`** 到 `build-resources/yt-dlp/`，再随安装包释放到 `resources/yt-dlp/`（Unlicense，以官方为准）。也可手动执行 `npm run fetch:ytdlp`。
+
 ### Windows：未签名构建与 `winCodeSign`
 
 `package.json` 中 `build.win.signAndEditExecutable` 默认为 **`false`**，避免 electron-builder 在修改 exe 资源时从 GitHub 拉取 `winCodeSign` 工具（在部分网络/TLS 环境下会失败）。**正式发布**若需 Authenticode 签名或必须写入版本资源，可改为 `true` 并配置证书（`CSC_LINK` / `CSC_KEY_PASSWORD` 等），并保证构建机能访问上述下载。
