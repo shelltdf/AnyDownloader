@@ -6,13 +6,20 @@
 - **构建**：`npm run build` → `any-downloader-vue/dist/`（静态 SPA）
 - **开发**：`npm run dev`（Vite）
 
+## Electron 套壳专有：视频下载（yt-dlp）
+
+- **网页版（纯 Vite SPA）**：不提供视频页下载；无 `window.anyDownloaderShell` 时不展示「视频下载」菜单与 🎬 工具栏按钮。
+- **Electron**：`electron/video-ytdlp.cjs` 注册 IPC；`preload.cjs` 暴露 `checkYtdlp`、`pickVideoOutputDir`、`startVideoDownload`、`cancelVideoDownload`、`onVideoYtdlpLog`。
+- **依赖**：用户本机须可用 `yt-dlp` / `yt-dlp.exe` 或 `python -m yt_dlp` 等；可选环境变量 **`YT_DLP_PATH`** 指向可执行文件。
+- **UI**：`App.vue` 在 `isElectron` 时提供「文件 → 视频下载（yt-dlp）…」与工具栏 🎬；弹窗内选目录、填 http(s) URL、查看 yt-dlp 文本输出、开始/取消。
+
 ## 界面区域（与实现 DOM 映射）
 
 | 区域 | 容器 id / 类 | 说明 |
 |------|----------------|------|
 | 标题条 | `#title-strip` | 产品名 + favicon |
 | 菜单栏 | `#menu-bar` | 文件、编辑、语言、主题、窗口、帮助；**帮助**含「下载方式」弹窗入口 |
-| 工具栏 | `#toolbar` | URL 输入；其余为**仅图标**按钮（`aria-label` / `title` 承载文案）：添加、队列、网页提取、全部开始/暂停/删除、清理完成 |
+| 工具栏 | `#toolbar` | URL 输入；其余为**仅图标**按钮（`aria-label` / `title` 承载文案）：添加、队列、网页提取、**Electron 时** 🎬 视频下载、全部开始/暂停/删除、清理完成 |
 | 下载列表 | `#download-list` | 表格；**右键**：开始、暂停、**重新开始**、删除、复制链接 |
 | 分割条 | `.splitter-left` / `.splitter-right` | 分别调整左、右侧 Dock 与列表宽度 |
 | 左侧 Dock | `#dock-area-left` | **网络测速**（默认**折叠**，仅展开「全局状态」）；**全局状态**（总速度、曲线+实时值、写入曲线、**并行任务数**自动/手动、**最大并行任务** 1–16 默认 2、**下载压力**最小/适中/最大、多连接设置） |

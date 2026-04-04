@@ -17,6 +17,8 @@ import { useI18n } from './composables/useI18n'
 import { useLog } from './composables/useLog'
 import { useSpeedTest } from './composables/useSpeedTest'
 import { useTheme } from './composables/useTheme'
+import { useElectronShell } from './composables/useElectronShell'
+import { useElectronVideo } from './composables/useElectronVideo'
 import { pickSaveLocation, pickSaveDirectory, type SavePickResult } from './utils/savePicker'
 import {
   extractHttpLinksFromPage,
@@ -26,12 +28,79 @@ import {
   type RichPageLink,
 } from './utils/extractPageLinks'
 import { extractUrlsFromText } from './utils/parseUrlsFromText'
+import { extractUrlsFromFileStream } from './utils/streamExtractUrlsFromFile'
 import { DOWNLOAD_METHOD_GROUPS } from './data/downloadMethodCatalog'
 import type { ChunkSlotState } from './composables/useDownloads'
 
 const { strings, setLocale, locale } = useI18n()
-const { lines, copyAll, log } = useLog()
+const { lines, copyAll, log, notify, statusHintText, statusHintLevel } = useLog()
 const { setMode } = useTheme()
+const {
+  isElectron,
+  shellVersion,
+  maximized,
+  electronChromeVisible,
+  winMinimize,
+  winMaximizeToggle,
+  winClose,
+  toggleElectronChromeFromContextMenu,
+} = useElectronShell()
+
+const {
+  videoModalOpen,
+  videoUrl,
+  videoOutDir,
+  videoLog,
+  videoRunning,
+  ytdlpAvailable,
+  ytdlpVia,
+  openVideoDownloadModal,
+  closeVideoDownloadModal,
+  recheckYtdlp,
+  pickVideoDir,
+  cancelVideoDownload,
+  startVideoDownload,
+} = useElectronVideo()
+
+function onVideoDownloadModalClose() {
+  if (videoRunning.value) void cancelVideoDownload()
+  closeVideoDownloadModal()
+}
+
+function runElectronVideoDownload() {
+  void startVideoDownload(
+    {
+      errInvalidUrl: strings.value.errInvalidUrl,
+      errVideoNoDir: strings.value.errVideoNoDir,
+      errVideoNoYtdlp: strings.value.errVideoNoYtdlp,
+      errVideoFailed: strings.value.errVideoFailed,
+      notifyVideoDone: strings.value.notifyVideoDone,
+      notifyVideoCancelled: strings.value.notifyVideoCancelled,
+    },
+    notify,
+  )
+}
+
+const appVersion = computed(() => {
+  const v = shellVersion.value?.trim()
+  if (v) return v
+  return __APP_VERSION__
+})
+
+watch(
+  () => [strings.value.appTitle, appVersion.value] as const,
+  () => {
+    const v = appVersion.value.trim()
+    document.title = v ? `${strings.value.appTitle} v${v}` : strings.value.appTitle
+  },
+  { immediate: true },
+)
+
+function onShellChromeContextMenu(e: MouseEvent) {
+  if (!isElectron) return
+  e.preventDefault()
+  toggleElectronChromeFromContextMenu()
+}
 const {
   tasks,
   selectedId,
@@ -73,6 +142,19 @@ interface AddParsedRow {
 }
 const addParsedRows = ref<AddParsedRow[]>([])
 
+/** 列表渲染上限，避免单页百万行拖垮 DOM */
+const MAX_ADD_MODAL_URLS = 25_000
+const addImportFileInput = ref<HTMLInputElement | null>(null)
+const importFileBusy = ref(false)
+const importFilePhase = ref<'reading' | 'building'>('reading')
+const importFileLoaded = ref(0)
+const importFileTotal = ref(0)
+let importAbortController: AbortController | null = null
+
+watch(addModalOpen, (open) => {
+  if (!open) importAbortController?.abort()
+})
+
 const leftDockWide = ref(300)
 const rightDockWide = ref(320)
 const draggingSplit = ref(false)
@@ -81,7 +163,25 @@ const dragTarget = ref<'left' | 'right' | null>(null)
 const pageUrl = ref('https://example.com/')
 const pageRichLinks = ref<RichPageLink[]>([])
 const pageSelected = reactive<Record<string, boolean>>({})
+const pageKindVisibility = reactive<Partial<Record<PageResourceKind, boolean>>>({})
 const pageDirHandle = ref<FileSystemDirectoryHandle | null>(null)
+
+const visiblePageLinks = computed(() =>
+  pageRichLinks.value.filter((r) => pageKindVisibility[r.kind] !== false),
+)
+
+const pageKindChips = computed(() => {
+  const m = new Map<PageResourceKind, { total: number; downloadable: number }>()
+  for (const row of pageRichLinks.value) {
+    const e = m.get(row.kind) ?? { total: 0, downloadable: 0 }
+    e.total++
+    if (row.canTryHttpDownload) e.downloadable++
+    m.set(row.kind, e)
+  }
+  return [...m.entries()]
+    .map(([kind, v]) => ({ kind, ...v }))
+    .sort((a, b) => String(a.kind).localeCompare(String(b.kind)))
+})
 
 type LeftDockKey = 'speed' | 'global'
 type RightDockKey = 'info' | 'chunks' | 'comm'
@@ -232,9 +332,11 @@ function taskConnDisplay(t: DownloadTask): string {
 }
 
 function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`
+  if (!Number.isFinite(n) || n < 0) return '0 B'
+  if (n < 1024) return `${Math.round(n)} B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  return `${(n / 1024 / 1024).toFixed(2)} MB`
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(2)} MB`
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
 const globalSparkLive = computed(() => {
@@ -338,7 +440,7 @@ async function openAddModal(prefill?: string) {
       const clip = await navigator.clipboard.readText()
       if (clip) addPasteText.value = clip
     } catch {
-      /* 剪贴板不可读则保留文本框已有内容 */
+      notify('warn', strings.value.errClipboardRead)
     }
   }
   void nextTick(() => {
@@ -352,25 +454,109 @@ async function openAddModalFresh() {
   await openAddModal()
 }
 
+function makeAddParsedRow(raw: string, i: number): AddParsedRow {
+  const expanded = expandLegacyDownloadLink(raw)
+  const det = detectProtocol(expanded)
+  const href = det?.href ?? expanded
+  const { kind } = classifyDownloadUrl(href)
+  const protoOk = det != null && det.protocol !== 'unknown'
+  const httpFamily = det != null && ['http', 'https', 'blob', 'data'].includes(det.protocol)
+  const canEnqueue = !!(protoOk && httpFamily && kind !== 'embed_page' && kind !== 'hls' && kind !== 'dash')
+  return {
+    id: `p-${i}`,
+    raw,
+    det,
+    kind,
+    canEnqueue,
+    selected: canEnqueue,
+  }
+}
+
 function parseAddModal() {
   const urls = extractUrlsFromText(addPasteText.value)
-  addParsedRows.value = urls.map((raw, i) => {
-    const expanded = expandLegacyDownloadLink(raw)
-    const det = detectProtocol(expanded)
-    const href = det?.href ?? expanded
-    const { kind } = classifyDownloadUrl(href)
-    const protoOk = det != null && det.protocol !== 'unknown'
-    const httpFamily = det != null && ['http', 'https', 'blob', 'data'].includes(det.protocol)
-    const canEnqueue = !!(protoOk && httpFamily && kind !== 'embed_page' && kind !== 'hls' && kind !== 'dash')
-    return {
-      id: `p-${i}`,
-      raw,
-      det,
-      kind,
-      canEnqueue,
-      selected: canEnqueue,
+  if (addPasteText.value.trim() && urls.length === 0) {
+    notify('warn', strings.value.errNoUrlsParsed)
+  }
+  addParsedRows.value = urls.map((raw, i) => makeAddParsedRow(raw, i))
+}
+
+function cancelImportFromFile() {
+  importAbortController?.abort()
+}
+
+async function onAddImportFileChange(ev: Event) {
+  const input = ev.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+
+  if (!addModalOpen.value) addModalOpen.value = true
+  await nextTick()
+
+  importFileBusy.value = true
+  importFilePhase.value = 'reading'
+  importFileLoaded.value = 0
+  importFileTotal.value = file.size
+  importAbortController?.abort()
+  importAbortController = new AbortController()
+  const ac = importAbortController
+
+  try {
+    const { urls, aborted } = await extractUrlsFromFileStream(file, {
+      signal: ac.signal,
+      onProgress: (loaded, total) => {
+        importFileLoaded.value = loaded
+        importFileTotal.value = total
+      },
+    })
+
+    if (aborted) {
+      notify('warn', strings.value.addImportCancelled)
+      return
     }
-  })
+
+    importFilePhase.value = 'building'
+    importFileLoaded.value = importFileTotal.value
+    const totalFound = urls.length
+    const limited = urls.slice(0, MAX_ADD_MODAL_URLS)
+    if (totalFound > MAX_ADD_MODAL_URLS) {
+      notify(
+        'warn',
+        strings.value.addImportTruncated.replace('{n}', String(totalFound)).replace('{m}', String(MAX_ADD_MODAL_URLS)),
+      )
+    }
+
+    addParsedRows.value = []
+    addPasteText.value =
+      totalFound > 0
+        ? `（${strings.value.addImportFromFileSummary} · ${totalFound}${totalFound > MAX_ADD_MODAL_URLS ? ` · ≤${MAX_ADD_MODAL_URLS}` : ''}）`
+        : ''
+
+    const BATCH = 300
+    for (let i = 0; i < limited.length; i += BATCH) {
+      if (ac.signal.aborted) {
+        notify('warn', strings.value.addImportCancelled)
+        return
+      }
+      const slice = limited.slice(i, i + BATCH).map((raw, j) => makeAddParsedRow(raw, i + j))
+      addParsedRows.value.push(...slice)
+      await new Promise<void>((r) => setTimeout(r, 0))
+    }
+
+    if (totalFound === 0) notify('warn', strings.value.errNoUrlsParsed)
+    else notify('info', strings.value.addImportDone.replace('{n}', String(totalFound)))
+  } catch (e) {
+    const err = e as Error
+    if (err.name === 'AbortError') notify('warn', strings.value.addImportCancelled)
+    else notify('error', `${strings.value.addImportFailed}: ${err.message}`)
+  } finally {
+    importFileBusy.value = false
+    importAbortController = null
+  }
+}
+
+function openAddImportFilePicker() {
+  addImportFileInput.value?.click()
 }
 
 function addSelectAllOk() {
@@ -386,14 +572,19 @@ function addDeselectAllModal() {
 async function enqueueAddModalSelections(startNow: boolean) {
   const rows = addParsedRows.value.filter((r) => r.selected && r.canEnqueue && r.det)
   if (!rows.length) {
-    log('warn', strings.value.addNoSelection)
+    notify('warn', strings.value.addNoSelection)
     return
   }
   let dir: FileSystemDirectoryHandle | null = null
   if (rows.length > 1) {
-    dir = await pickSaveDirectory()
+    try {
+      dir = await pickSaveDirectory()
+    } catch (e) {
+      notify('error', `${strings.value.errDirPicker}: ${(e as Error).message}`)
+      return
+    }
     if (!dir) {
-      log('warn', strings.value.pageDirRequired)
+      notify('warn', strings.value.pageDirRequired)
       return
     }
   }
@@ -407,20 +598,30 @@ async function enqueueAddModalSelections(startNow: boolean) {
         const h = await dir.getFileHandle(name, { create: true })
         save = { fileName: name, handle: h }
       } catch (e) {
-        log('error', `${name}: ${(e as Error).message}`)
+        const msg = `${name}: ${(e as Error).message}`
+        log('error', msg)
+        notify('error', msg)
         continue
       }
     } else {
       save = await pickSaveLocation(name)
-      if (!save) return
+      if (!save) {
+        notify('warn', strings.value.errSaveCancelled)
+        return
+      }
     }
     enqueueTask(det, save)
   }
-  if (tasks.length === before) return
+  if (tasks.length === before) {
+    notify('warn', strings.value.errEnqueueNone)
+    return
+  }
   const added = tasks.slice(before)
   addModalOpen.value = false
   addPasteText.value = ''
   addParsedRows.value = []
+  const doneMsg = (startNow ? strings.value.addDoneStarted : strings.value.addDoneQueued).replace('{n}', String(added.length))
+  notify('info', doneMsg)
   if (startNow && added.length) {
     await Promise.all(added.map((t) => startTask(t.id, strings.value.errNeedBackend, strings.value.errCors)))
   }
@@ -435,7 +636,7 @@ async function pasteIntoAddModal() {
     addPasteText.value = await navigator.clipboard.readText()
     parseAddModal()
   } catch {
-    log('warn', 'Clipboard read failed')
+    notify('warn', strings.value.errClipboardRead)
   }
 }
 
@@ -447,6 +648,7 @@ function applyPerTaskThreads() {
   else {
     const n = parseInt(raw, 10)
     if (!Number.isNaN(n) && n >= 1 && n <= 16) setTaskThreadOverride(t.id, n)
+    else notify('warn', strings.value.threadInvalidRange)
   }
 }
 
@@ -468,7 +670,8 @@ function taskStatusLabel(t: DownloadTask): string {
 
 async function onCopyLog() {
   const ok = await copyAll()
-  if (ok) log('info', 'Log copied.')
+  if (ok) notify('info', strings.value.logCopiedOk)
+  else notify('error', strings.value.errClipboardCopyLog)
 }
 
 function onSplitLeftDown(e: MouseEvent) {
@@ -543,13 +746,19 @@ function ctxRemove() {
 }
 
 function onRemoveAllTasks() {
-  if (!tasks.length) return
+  if (!tasks.length) {
+    notify('warn', strings.value.notifyNoTasksToRemove)
+    return
+  }
   if (!window.confirm(strings.value.confirmRemoveAll)) return
   removeAllTasks()
 }
 
 function onClearDoneTasks() {
-  if (!tasks.some((t) => t.status === 'done')) return
+  if (!tasks.some((t) => t.status === 'done')) {
+    notify('warn', strings.value.notifyNoDoneToClear)
+    return
+  }
   if (!window.confirm(strings.value.confirmClearDone)) return
   clearDoneTasks()
 }
@@ -560,51 +769,106 @@ async function ctxCopyUrl() {
   if (!t) return
   try {
     await navigator.clipboard.writeText(t.href)
-    log('info', 'URL copied')
+    notify('info', strings.value.urlCopiedOk)
   } catch {
-    log('warn', 'Copy failed')
+    notify('warn', strings.value.errClipboardCopyLog)
   }
 }
 
 async function onRunSpeed() {
   await runAll(locale.value)
+  if (lastError.value) {
+    notify('error', `${strings.value.speedTestRunFailed}: ${lastError.value}`, { persist: true })
+    return
+  }
+  const n = regions.length
+  if (n > 0 && regions.every((r) => r.downloadError)) {
+    notify('error', strings.value.speedAllDownloadsFailed, { persist: true })
+  }
+}
+
+function resetPageKindVisibility() {
+  for (const k of Object.keys(pageKindVisibility) as PageResourceKind[]) {
+    delete pageKindVisibility[k]
+  }
+  for (const row of pageRichLinks.value) {
+    pageKindVisibility[row.kind] = true
+  }
+}
+
+function togglePageKindVisible(kind: PageResourceKind) {
+  const cur = pageKindVisibility[kind] !== false
+  pageKindVisibility[kind] = !cur
+}
+
+function pageSelectByKind(kind: PageResourceKind) {
+  for (const row of pageRichLinks.value) {
+    if (row.kind === kind && row.canTryHttpDownload) pageSelected[row.url] = true
+  }
 }
 
 async function fetchPageLinks() {
   const r = await extractHttpLinksFromPage(pageUrl.value)
   if (r.error) {
-    log('error', r.error)
+    const msg = `${strings.value.pageFetchFailed}: ${r.error}`
+    log('error', msg)
+    notify('error', msg, { persist: true })
     pageRichLinks.value = []
     for (const k of Object.keys(pageSelected)) delete pageSelected[k]
+    for (const key of Object.keys(pageKindVisibility) as PageResourceKind[]) delete pageKindVisibility[key]
     return
   }
   pageRichLinks.value = r.links
   for (const k of Object.keys(pageSelected)) delete pageSelected[k]
+  resetPageKindVisibility()
   for (const row of r.links) {
     pageSelected[row.url] = row.canTryHttpDownload
   }
-  if (!r.links.length) log('warn', strings.value.pageNoLinks)
+  if (!r.links.length) notify('warn', strings.value.pageNoLinks)
 }
 
 async function choosePageDir() {
-  const d = await pickSaveDirectory()
-  pageDirHandle.value = d
-  if (!d) log('warn', strings.value.pageDirRequired)
+  try {
+    const d = await pickSaveDirectory()
+    pageDirHandle.value = d
+    if (!d) notify('warn', strings.value.pageDirRequired)
+  } catch (e) {
+    notify('error', `${strings.value.errDirPicker}: ${(e as Error).message}`)
+  }
 }
 
 function pageSelectAll(v: boolean) {
-  for (const row of pageRichLinks.value) {
+  for (const row of visiblePageLinks.value) {
     pageSelected[row.url] = row.canTryHttpDownload ? v : false
   }
 }
 
-async function addSelectedFromPage() {
+async function openPageImportModal() {
+  pageModalOpen.value = true
+  await nextTick()
+  try {
+    const t = await navigator.clipboard.readText()
+    const u = t.trim()
+    if (!u) return
+    if (/^https?:\/\//i.test(u)) {
+      pageUrl.value = u
+      return
+    }
+    const urls = extractUrlsFromText(u)
+    const first = urls.find((x) => /^https?:\/\//i.test(x))
+    if (first) pageUrl.value = first
+  } catch {
+    notify('warn', strings.value.errClipboardRead)
+  }
+}
+
+async function addSelectedFromPage(startNow: boolean) {
   const dir = pageDirHandle.value
   if (!dir) {
-    log('warn', strings.value.pageDirRequired)
+    notify('warn', strings.value.pageDirRequired)
     return
   }
-  let n = 0
+  const before = tasks.length
   for (const row of pageRichLinks.value) {
     if (!pageSelected[row.url] || !row.canTryHttpDownload) continue
     const det = detectProtocol(row.url)
@@ -614,13 +878,23 @@ async function addSelectedFromPage() {
     try {
       const handle = await dir.getFileHandle(name, { create: true })
       enqueueTask(det, { fileName: name, handle })
-      n++
     } catch (e) {
-      log('error', `${name}: ${(e as Error).message}`)
+      const msg = `${name}: ${(e as Error).message}`
+      log('error', msg)
+      notify('error', msg)
     }
   }
-  log('info', `Enqueued ${n} tasks`)
+  if (tasks.length === before) {
+    notify('warn', strings.value.pageNoSelection)
+    return
+  }
+  const added = tasks.slice(before)
+  const doneMsg = (startNow ? strings.value.addDoneStarted : strings.value.addDoneQueued).replace('{n}', String(added.length))
+  notify('info', doneMsg)
   pageModalOpen.value = false
+  if (startNow && added.length) {
+    await Promise.all(added.map((t) => startTask(t.id, strings.value.errNeedBackend, strings.value.errCors)))
+  }
 }
 
 function chunkClass(s: ChunkSlotState): string {
@@ -686,12 +960,52 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="app-root" :class="{ 'is-dragging': draggingSplit }">
-    <header id="title-strip" class="title-strip">
-      <img class="app-icon" src="/favicon.svg" width="20" height="20" alt="" />
-      <span class="app-name">{{ strings.appTitle }}</span>
+  <div
+    class="app-root"
+    :class="{ 'is-dragging': draggingSplit, 'is-electron-shell': isElectron }"
+  >
+    <template v-if="!isElectron || electronChromeVisible">
+    <header
+      id="title-strip"
+      class="title-strip"
+      :title="isElectron ? strings.shellTitleContextHint : undefined"
+      @contextmenu="onShellChromeContextMenu"
+    >
+      <div class="title-strip-drag">
+        <img class="app-icon" src="/favicon.svg" width="20" height="20" alt="" />
+        <span class="app-name">{{ strings.appTitle }}</span>
+        <span v-if="appVersion" class="app-version muted">v{{ appVersion }}</span>
+      </div>
+      <div v-if="isElectron" class="shell-window-controls" role="group" :aria-label="strings.shellWindowControlsAria">
+        <button
+          type="button"
+          class="shell-win-btn shell-win-min"
+          :title="strings.shellWinMin"
+          :aria-label="strings.shellWinMin"
+          @click="winMinimize"
+        >
+          &#x2012;
+        </button>
+        <button
+          type="button"
+          class="shell-win-btn shell-win-max"
+          :title="maximized ? strings.shellWinRestore : strings.shellWinMax"
+          :aria-label="maximized ? strings.shellWinRestore : strings.shellWinMax"
+          @click="winMaximizeToggle"
+        >
+          {{ maximized ? '\u25a3' : '\u25a1' }}
+        </button>
+        <button
+          type="button"
+          class="shell-win-btn shell-win-close"
+          :title="strings.shellWinClose"
+          :aria-label="strings.shellWinClose"
+          @click="winClose"
+        >
+          &#x2715;
+        </button>
+      </div>
     </header>
-
     <nav id="menu-bar" class="menu-bar" role="menubar" aria-label="Main">
       <div class="menu-top">
         <span class="menu-root">
@@ -700,13 +1014,25 @@ onUnmounted(() => {
             <button type="button" class="menu-item" @click="clearAndOpenAdd">
               {{ strings.addUrl }}
             </button>
-            <button type="button" class="menu-item" @click="pageModalOpen = true">{{ strings.pageFromWeb }}</button>
+            <button type="button" class="menu-item" @click="openAddImportFilePicker">
+              {{ strings.addImportFromFile }}
+            </button>
+            <button type="button" class="menu-item" @click="void openPageImportModal()">{{ strings.pageFromWeb }}</button>
+            <button
+              v-if="isElectron"
+              type="button"
+              class="menu-item"
+              @click="openVideoDownloadModal"
+            >
+              {{ strings.menuVideoDownload }}
+            </button>
             <button type="button" class="menu-item" @click="void startAll(strings.errNeedBackend, strings.errCors)">
               {{ strings.toolbarAllStart }}
             </button>
             <button type="button" class="menu-item" @click="pauseAll">{{ strings.toolbarAllPause }}</button>
             <button type="button" class="menu-item" @click="onRemoveAllTasks">{{ strings.toolbarAllRemove }}</button>
             <button type="button" class="menu-item" @click="onClearDoneTasks">{{ strings.toolbarClearDone }}</button>
+            <button v-if="isElectron" type="button" class="menu-item" @click="winClose">{{ strings.shellQuitApp }}</button>
           </div>
         </span>
         <span class="menu-root">
@@ -745,7 +1071,11 @@ onUnmounted(() => {
       </div>
     </nav>
 
-    <div id="toolbar" class="toolbar">
+    <div
+      id="toolbar"
+      class="toolbar"
+      @contextmenu="onShellChromeContextMenu"
+    >
       <button
         type="button"
         class="tb-btn tb-icon"
@@ -758,11 +1088,30 @@ onUnmounted(() => {
       <button
         type="button"
         class="tb-btn tb-icon"
+        :aria-label="strings.addImportFromFile"
+        :title="strings.addImportFromFile"
+        @click="openAddImportFilePicker"
+      >
+        📄
+      </button>
+      <button
+        type="button"
+        class="tb-btn tb-icon"
         :aria-label="strings.pageFromWeb"
         :title="strings.pageFromWeb"
-        @click="pageModalOpen = true"
+        @click="void openPageImportModal()"
       >
         🌐
+      </button>
+      <button
+        v-if="isElectron"
+        type="button"
+        class="tb-btn tb-icon"
+        :aria-label="strings.toolbarVideoDownload"
+        :title="strings.toolbarVideoDownload"
+        @click="openVideoDownloadModal"
+      >
+        🎬
       </button>
       <span class="tb-sep" />
       <button
@@ -795,6 +1144,53 @@ onUnmounted(() => {
       >
         ✓
       </button>
+    </div>
+    </template>
+
+    <div
+      v-else-if="isElectron"
+      id="toolbar"
+      class="toolbar toolbar-shell-compact"
+      role="toolbar"
+      :title="strings.shellToolbarCompactHint"
+      @contextmenu="onShellChromeContextMenu"
+    >
+      <div class="toolbar-shell-compact-inner">
+        <div class="toolbar-shell-compact-drag">
+          <img class="app-icon" src="/favicon.svg" width="20" height="20" alt="" />
+          <span class="app-name">{{ strings.appTitle }}</span>
+          <span v-if="appVersion" class="app-version muted">v{{ appVersion }}</span>
+        </div>
+        <div class="shell-window-controls" role="group" :aria-label="strings.shellWindowControlsAria">
+          <button
+            type="button"
+            class="shell-win-btn shell-win-min"
+            :title="strings.shellWinMin"
+            :aria-label="strings.shellWinMin"
+            @click="winMinimize"
+          >
+            &#x2012;
+          </button>
+          <button
+            type="button"
+            class="shell-win-btn shell-win-max"
+            :title="maximized ? strings.shellWinRestore : strings.shellWinMax"
+            :aria-label="maximized ? strings.shellWinRestore : strings.shellWinMax"
+            @click="winMaximizeToggle"
+          >
+            {{ maximized ? '\u25a3' : '\u25a1' }}
+          </button>
+          <button
+            type="button"
+            class="shell-win-btn shell-win-close"
+            :title="strings.shellWinClose"
+            :aria-label="strings.shellWinClose"
+            @click="winClose"
+          >
+            &#x2715;
+          </button>
+        </div>
+      </div>
     </div>
 
     <div id="main-row" class="main-row">
@@ -851,16 +1247,23 @@ onUnmounted(() => {
                 {{ speedRunning ? strings.speedTesting : strings.speedTest }}
               </button>
               <p class="muted small">{{ strings.speedUploadNote }}</p>
+              <p class="muted small">{{ strings.speedPingNote }}</p>
               <table class="speed-table" aria-label="Regional speed">
                 <thead>
                   <tr>
                     <th>{{ strings.speedColRegion }}</th>
+                    <th>{{ strings.speedColPing }}</th>
                     <th>{{ strings.speedColDown }}</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr v-for="r in regions" :key="r.id">
                     <td>{{ r.label }}</td>
+                    <td>
+                      <span v-if="r.pingError" class="err-small">{{ r.pingError }}</span>
+                      <span v-else-if="r.pingMs != null">{{ r.pingMs }} ms</span>
+                      <span v-else class="muted">—</span>
+                    </td>
                     <td>
                       <span v-if="r.downloadError" class="err-small">{{ r.downloadError }}</span>
                       <span v-else>{{ formatMbps(r.downloadMbps) }}</span>
@@ -1233,7 +1636,16 @@ onUnmounted(() => {
       @click="logOpen = true"
       @keydown.enter.prevent="logOpen = true"
     >
-      {{ statusSummary }} · {{ strings.threadPolicy }}: {{ threadPolicyDisplay }}
+      <div class="status-bar-main">
+        {{ statusSummary }} · {{ strings.threadPolicy }}: {{ threadPolicyDisplay }}
+      </div>
+      <div
+        v-if="statusHintText"
+        class="status-bar-hint"
+        :class="statusHintLevel ? `hint-${statusHintLevel}` : ''"
+      >
+        {{ statusHintText }}
+      </div>
     </footer>
 
     <div
@@ -1301,13 +1713,35 @@ onUnmounted(() => {
       </div>
     </div>
 
+    <input
+      ref="addImportFileInput"
+      class="visually-hidden-file"
+      type="file"
+      accept=".txt,.text,.log,.lst,.list,.url,.urls,.csv,text/plain,*/*"
+      @change="onAddImportFileChange"
+    />
+
     <div v-if="addModalOpen" class="modal-backdrop" @click.self="addModalOpen = false">
       <div class="modal add-modal" role="dialog" aria-labelledby="add-h">
         <header class="modal-head">
           <h2 id="add-h">{{ strings.addModalTitle }}</h2>
           <button type="button" class="icon-btn" @click="addModalOpen = false">{{ strings.logClose }}</button>
         </header>
-        <div class="add-modal-body">
+        <div class="add-modal-body" :class="{ 'add-modal-body-busy': importFileBusy }">
+          <div v-if="importFileBusy" class="add-import-panel" role="status">
+            <p class="add-import-status">
+              {{ importFilePhase === 'reading' ? strings.addImportReading : strings.addImportBuilding }}
+            </p>
+            <progress
+              class="add-import-progress"
+              :value="importFileLoaded"
+              :max="Math.max(importFileTotal, 1)"
+            />
+            <p class="small mono add-import-bytes">
+              {{ formatBytes(importFileLoaded) }} / {{ formatBytes(importFileTotal) }}
+            </p>
+            <button type="button" class="tb-btn" @click="cancelImportFromFile">{{ strings.addImportCancel }}</button>
+          </div>
           <p class="muted small">{{ strings.addPasteHint }}</p>
           <textarea
             ref="addModalTa"
@@ -1315,12 +1749,24 @@ onUnmounted(() => {
             class="add-paste-ta"
             rows="8"
             spellcheck="false"
+            :disabled="importFileBusy"
           />
           <div class="add-modal-actions add-modal-actions-top">
-            <button type="button" class="tb-btn" @click="parseAddModal">{{ strings.addParseBtn }}</button>
-            <button type="button" class="tb-btn" @click="addSelectAllOk">{{ strings.addSelectOk }}</button>
-            <button type="button" class="tb-btn" @click="addDeselectAllModal">{{ strings.addDeselectAll }}</button>
-            <button type="button" class="tb-btn" @click="pasteIntoAddModal">{{ strings.addPasteFromClipboard }}</button>
+            <button type="button" class="tb-btn" @click="parseAddModal" :disabled="importFileBusy">
+              {{ strings.addParseBtn }}
+            </button>
+            <button type="button" class="tb-btn" @click="addSelectAllOk" :disabled="importFileBusy">
+              {{ strings.addSelectOk }}
+            </button>
+            <button type="button" class="tb-btn" @click="addDeselectAllModal" :disabled="importFileBusy">
+              {{ strings.addDeselectAll }}
+            </button>
+            <button type="button" class="tb-btn" @click="pasteIntoAddModal" :disabled="importFileBusy">
+              {{ strings.addPasteFromClipboard }}
+            </button>
+            <button type="button" class="tb-btn" @click="openAddImportFilePicker" :disabled="importFileBusy">
+              {{ strings.addImportFromFile }}
+            </button>
           </div>
           <div v-if="addParsedRows.length" class="add-parse-wrap">
             <table class="add-parse-table">
@@ -1347,11 +1793,63 @@ onUnmounted(() => {
             </table>
           </div>
           <div class="add-modal-actions add-modal-actions-bottom">
-            <button type="button" class="tb-btn primary" @click="enqueueAddModalSelections(true)">
+            <button
+              type="button"
+              class="tb-btn primary"
+              :disabled="importFileBusy"
+              @click="enqueueAddModalSelections(true)"
+            >
               {{ strings.addStartSelected }}
             </button>
-            <button type="button" class="tb-btn" @click="enqueueAddModalSelections(false)">
+            <button type="button" class="tb-btn" :disabled="importFileBusy" @click="enqueueAddModalSelections(false)">
               {{ strings.addQueueSelected }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div
+      v-if="videoModalOpen && isElectron"
+      class="modal-backdrop"
+      role="presentation"
+      @click.self="onVideoDownloadModalClose"
+    >
+      <div class="modal page-modal" role="dialog" aria-labelledby="video-dl-h">
+        <header class="modal-head">
+          <h2 id="video-dl-h">{{ strings.videoDownloadTitle }}</h2>
+          <button type="button" class="icon-btn" @click="onVideoDownloadModalClose">{{ strings.logClose }}</button>
+        </header>
+        <div class="page-body">
+          <p class="muted small">{{ strings.videoDownloadHint }}</p>
+          <p v-if="ytdlpAvailable === true" class="small video-ytdlp-status-ok">
+            {{ strings.videoYtdlpOk }}
+            <span v-if="ytdlpVia" class="mono"> · {{ strings.videoYtdlpViaPrefix }} {{ ytdlpVia }}</span>
+          </p>
+          <p v-else-if="ytdlpAvailable === false" class="small err-small">{{ strings.videoYtdlpMissing }}</p>
+          <p v-else class="small muted">{{ strings.videoDownloadRecheckYtdlp }}…</p>
+          <div class="page-actions">
+            <button type="button" class="tb-btn" :disabled="videoRunning" @click="void recheckYtdlp()">
+              {{ strings.videoDownloadRecheckYtdlp }}
+            </button>
+            <button type="button" class="tb-btn" @click="void pickVideoDir()">{{ strings.videoDownloadPickDir }}</button>
+          </div>
+          <p v-if="videoOutDir" class="small mono break">📁 {{ videoOutDir }}</p>
+          <label class="page-label">{{ strings.videoDownloadUrlLabel }}</label>
+          <input v-model="videoUrl" class="url-input page-url-inp" type="url" :disabled="videoRunning" />
+          <p class="small muted">{{ strings.videoDownloadLogLabel }}</p>
+          <pre class="log-pre video-ytdlp-log">{{ videoLog || '—' }}</pre>
+          <div class="page-actions page-actions-footer">
+            <button
+              type="button"
+              class="tb-btn primary"
+              :disabled="videoRunning || ytdlpAvailable === false"
+              @click="runElectronVideoDownload"
+            >
+              {{ strings.videoDownloadStart }}
+            </button>
+            <button type="button" class="tb-btn" :disabled="!videoRunning" @click="void cancelVideoDownload()">
+              {{ strings.videoDownloadCancelOp }}
             </button>
           </div>
         </div>
@@ -1373,17 +1871,45 @@ onUnmounted(() => {
             <button type="button" class="tb-btn" @click="choosePageDir">{{ strings.pagePickDir }}</button>
             <button type="button" class="tb-btn" @click="pageSelectAll(true)">{{ strings.pageSelectAll }}</button>
             <button type="button" class="tb-btn" @click="pageSelectAll(false)">{{ strings.pageClear }}</button>
-            <button type="button" class="tb-btn" @click="addSelectedFromPage">{{ strings.pageAddSelected }}</button>
           </div>
           <p v-if="pageDirHandle" class="small mono">📁 {{ pageDirHandle.name }}</p>
+          <div v-if="pageKindChips.length" class="page-kind-section">
+            <p class="small muted page-kind-hint">{{ strings.pageKindFilter }}</p>
+            <div class="page-kind-chips">
+              <div v-for="c in pageKindChips" :key="c.kind" class="page-kind-chip-wrap">
+                <button
+                  type="button"
+                  class="page-kind-chip"
+                  :class="{ 'page-kind-chip-off': pageKindVisibility[c.kind] === false }"
+                  @click="togglePageKindVisible(c.kind)"
+                >
+                  {{ linkKindLabel(c.kind) }} ({{ c.total }})
+                </button>
+                <button
+                  v-if="c.downloadable > 0"
+                  type="button"
+                  class="tb-btn page-kind-select-btn"
+                  @click="pageSelectByKind(c.kind)"
+                >
+                  {{ strings.pageKindSelectThis }}
+                </button>
+              </div>
+            </div>
+          </div>
           <div class="page-link-list">
-            <p class="small">{{ strings.pageLinks }} ({{ pageRichLinks.length }})</p>
-            <label v-for="row in pageRichLinks" :key="row.url" class="page-link-row">
+            <p class="small">{{ strings.pageLinks }} ({{ visiblePageLinks.length }}/{{ pageRichLinks.length }})</p>
+            <label v-for="row in visiblePageLinks" :key="row.url" class="page-link-row">
               <input v-model="pageSelected[row.url]" type="checkbox" :disabled="!row.canTryHttpDownload" />
               <span class="page-link-kind">{{ linkKindLabel(row.kind) }}</span>
               <span class="mono break page-link-url">{{ row.url }}</span>
               <span class="small muted page-link-hint">{{ pageLinkHint(row) }}</span>
             </label>
+          </div>
+          <div class="page-actions page-actions-footer">
+            <button type="button" class="tb-btn primary" @click="addSelectedFromPage(true)">
+              {{ strings.pageDownloadSelected }}
+            </button>
+            <button type="button" class="tb-btn" @click="addSelectedFromPage(false)">{{ strings.pageAddSelected }}</button>
           </div>
         </div>
       </div>

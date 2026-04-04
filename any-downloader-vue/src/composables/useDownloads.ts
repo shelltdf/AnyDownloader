@@ -1,5 +1,5 @@
 import { computed, reactive, ref, watch } from 'vue'
-import { type DetectedProtocol, type ProtocolDetectResult } from '../utils/protocol'
+import { protocolLabel, type DetectedProtocol, type ProtocolDetectResult } from '../utils/protocol'
 import type { SavePickResult } from '../utils/savePicker'
 import { idbDeletePartial, idbLoadPartial, idbSavePartial, type PersistedHttpTask } from '../utils/downloadIdb'
 import { useDownloadThreads } from './useDownloadThreads'
@@ -159,7 +159,7 @@ function recordDiskWrite(bytes: number, ms: number) {
   sessionIoStats.writeBps = (bytes * 1000) / t
 }
 
-const { log } = useLog()
+const { log, notify } = useLog()
 
 /** 用于判断是否「同一下载任务」（去 hash，规范化 URL） */
 export function downloadIdentityKey(href: string): string {
@@ -666,7 +666,7 @@ async function runHttpMultipart(task: DownloadTask, corsMsg: string) {
       const isNet =
         /failed to fetch|load failed|networkerror|aborted/i.test(err.message) || err.name === 'TypeError'
       task.errorMessage = isNet ? corsMsg : err.message
-      log('error', `${task.displayUrl}: ${err.message}`)
+      notify('error', `${task.displayUrl}: ${task.errorMessage ?? err.message}`)
     }
   } finally {
     stopSpeedSampler(task)
@@ -824,7 +824,7 @@ async function runDataTask(task: DownloadTask) {
     task.errorMessage = (e as Error).message
     task.activeConnections = 0
     task.isWriting = false
-    log('error', `data: ${task.errorMessage}`)
+    notify('error', `data: ${task.errorMessage}`)
   } finally {
     stopSpeedSampler(task)
   }
@@ -834,7 +834,7 @@ function placeholderFail(task: DownloadTask, i18nKey: string) {
   task.runFinishedAt = Date.now()
   task.status = 'error'
   task.errorMessage = i18nKey
-  log('warn', `${task.protocol}: ${task.href}`)
+  notify('error', `${protocolLabel(task.protocol)} · ${task.displayUrl}: ${i18nKey}`)
 }
 
 function makeTask(det: ProtocolDetectResult, save: SavePickResult): DownloadTask {
@@ -892,7 +892,7 @@ function resetTaskProgress(task: DownloadTask) {
 export function useDownloads() {
   function enqueueTask(det: ProtocolDetectResult, save: SavePickResult): boolean {
     if (hasDuplicateDownloadHref(det.href)) {
-      log('warn', `${tMsg('duplicateDownloadSkipped')} ${det.displayUrl}`)
+      notify('warn', `${tMsg('duplicateDownloadSkipped')} ${det.displayUrl}`)
       return false
     }
     const task = makeTask(det, save)
@@ -974,8 +974,16 @@ export function useDownloads() {
   }
 
   function startTask(id: string | null, errNeedBackend: string, corsMsg: string) {
-    const task = id ? tasks.find((t) => t.id === id) : null
-    if (!task || task.status === 'running' || task.status === 'done') return
+    if (!id) {
+      if (tasks.length > 0) notify('warn', tMsg('notifyNoTaskSelected'))
+      return
+    }
+    const task = tasks.find((t) => t.id === id) ?? null
+    if (!task) {
+      notify('warn', tMsg('notifyTaskNotFound'))
+      return
+    }
+    if (task.status === 'running' || task.status === 'done') return
     if (task.status === 'error') {
       resetTaskProgress(task)
       task.status = 'queued'
@@ -986,8 +994,16 @@ export function useDownloads() {
   }
 
   function restartTask(id: string | null, errNeedBackend: string, corsMsg: string) {
-    const task = id ? tasks.find((t) => t.id === id) : null
-    if (!task || task.status === 'running') return
+    if (!id) {
+      if (tasks.length > 0) notify('warn', tMsg('notifyNoTaskSelected'))
+      return
+    }
+    const task = tasks.find((t) => t.id === id) ?? null
+    if (!task) {
+      notify('warn', tMsg('notifyTaskNotFound'))
+      return
+    }
+    if (task.status === 'running') return
     task.abort?.abort()
     resetTaskProgress(task)
     task.status = 'queued'
@@ -1001,15 +1017,34 @@ export function useDownloads() {
   function startAll(errNeedBackend: string, corsMsg: string) {
     lastErrBackend = errNeedBackend
     lastCorsMsg = corsMsg
+    if (tasks.length === 0) {
+      notify('warn', tMsg('notifyNoTasks'))
+      return
+    }
     const pending = tasks.filter((t) => t.status === 'queued' || t.status === 'paused' || t.status === 'error')
+    if (pending.length === 0) {
+      notify('warn', tMsg('notifyNothingToStart'))
+      return
+    }
     for (const t of pending) {
       startTask(t.id, errNeedBackend, corsMsg)
     }
   }
 
   function pauseTask(id: string | null) {
-    const task = id ? tasks.find((t) => t.id === id) : null
-    if (!task || task.status !== 'running') return
+    if (!id) {
+      if (tasks.length > 0) notify('warn', tMsg('notifyNoTaskSelected'))
+      return
+    }
+    const task = tasks.find((t) => t.id === id) ?? null
+    if (!task) {
+      notify('warn', tMsg('notifyTaskNotFound'))
+      return
+    }
+    if (task.status !== 'running') {
+      notify('warn', tMsg('notifyTaskNotRunning'))
+      return
+    }
     task.abort?.abort()
   }
 

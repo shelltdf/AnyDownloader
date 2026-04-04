@@ -1,14 +1,15 @@
 import { expandLegacyDownloadLink } from './protocol'
 
-/** 从任意文本中提取可识别的下载相关 URL（去重） */
-export function extractUrlsFromText(text: string): string[] {
-  const set = new Set<string>()
-  const body = text || ''
+const URL_LINE_RE =
+  /https?:\/\/[^\s"'<>\][(){}]+|magnet:\?[^\s"'<>\][()]+|thunder:\/\/[^\s"'<>\][()]+|flashget:\/\/[^\s"'<>\][()]+|qqdl:\/\/[^\s"'<>\][()]+/gi
 
-  const re =
-    /https?:\/\/[^\s"'<>\][(){}]+|magnet:\?[^\s"'<>\][()]+|thunder:\/\/[^\s"'<>\][()]+|flashget:\/\/[^\s"'<>\][()]+|qqdl:\/\/[^\s"'<>\][()]+/gi
+/** 将一段文本中的下载相关 URL 并入集合（用于流式按行/按块解析） */
+export function addUrlsFromTextFragment(fragment: string, set: Set<string>): void {
+  const body = fragment || ''
+
+  URL_LINE_RE.lastIndex = 0
   let m: RegExpExecArray | null
-  while ((m = re.exec(body))) {
+  while ((m = URL_LINE_RE.exec(body))) {
     let s = m[0].replace(/[,;.)}\]]+$/g, '')
     s = expandLegacyDownloadLink(s.trim())
     if (s.length > 8 && s.length < 8192) set.add(s)
@@ -28,6 +29,11 @@ export function extractUrlsFromText(text: string): string[] {
       if (head.length > 8) set.add(head)
     }
   }
+}
 
+/** 从任意文本中提取可识别的下载相关 URL（去重） */
+export function extractUrlsFromText(text: string): string[] {
+  const set = new Set<string>()
+  addUrlsFromTextFragment(text, set)
   return [...set].sort((a, b) => a.localeCompare(b))
 }

@@ -1,8 +1,12 @@
 import { reactive, ref } from 'vue'
+import { locale } from './useI18n'
 
 export interface RegionRow {
   id: string
   label: string
+  /** 至响应头返回的 HTTP 往返时间（毫秒），非 ICMP */
+  pingMs: number | null
+  pingError: string | null
   downloadMbps: number | null
   downloadError: string | null
 }
@@ -57,6 +61,8 @@ const regions = reactive<RegionRow[]>(
   REGION_DEFS.map((d) => ({
     id: d.id,
     label: '',
+    pingMs: null,
+    pingError: null,
     downloadMbps: null,
     downloadError: null,
   })),
@@ -66,6 +72,31 @@ function setRegionLabels(locale: 'zh' | 'en') {
   REGION_DEFS.forEach((d, i) => {
     regions[i].label = locale === 'zh' ? d.zh : d.en
   })
+}
+
+/** 浏览器内对该 URL 的 HTTP 请求至收到响应头的耗时（近似 ping，非 ICMP） */
+async function measureHttpPingMs(url: string): Promise<{ ms: number | null; err: string | null }> {
+  const t0 = performance.now()
+  const ac = new AbortController()
+  const tid = window.setTimeout(() => ac.abort(), 15000)
+  try {
+    const res = await fetch(url, { mode: 'cors', cache: 'no-store', signal: ac.signal })
+    clearTimeout(tid)
+    const ms = Math.round(performance.now() - t0)
+    try {
+      await res.body?.cancel()
+    } catch {
+      /* ignore cancel errors */
+    }
+    if (!res.ok) return { ms: null, err: `HTTP ${res.status}` }
+    return { ms, err: null }
+  } catch (e) {
+    clearTimeout(tid)
+    const err = e as Error
+    const msg =
+      err.name === 'AbortError' ? (locale.value === 'zh' ? '超时' : 'timeout') : err.message
+    return { ms: null, err: msg }
+  }
 }
 
 async function measureDownloadMbps(url: string): Promise<{ mbps: number | null; err: string | null }> {
@@ -113,13 +144,19 @@ export function useSpeedTest() {
     uploadError.value = null
     uploadMbps.value = null
     regions.forEach((r) => {
+      r.pingMs = null
+      r.pingError = null
       r.downloadMbps = null
       r.downloadError = null
     })
 
     try {
       for (let i = 0; i < REGION_DEFS.length; i++) {
-        const { mbps, err } = await measureDownloadMbps(REGION_DEFS[i].url)
+        const url = REGION_DEFS[i].url
+        const ping = await measureHttpPingMs(url)
+        regions[i].pingMs = ping.ms
+        regions[i].pingError = ping.err
+        const { mbps, err } = await measureDownloadMbps(url)
         regions[i].downloadMbps = mbps
         regions[i].downloadError = err
       }

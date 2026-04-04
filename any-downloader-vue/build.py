@@ -15,7 +15,7 @@
 可选参数（可组合）：
 
 - ``--web-only`` — 只构建网页，不运行 electron-builder。
-- ``--electron-dir`` — 网页构建后仅 ``electron-builder --dir``（release/*-unpacked，无安装包）。
+- ``--electron-dir`` — 网页构建后仅 ``electron-builder --dir``（release/*-unpacked，无安装包）。**``run.py`` 启动桌面版依赖此产物**（或曾成功生成过同路径的 unpacked）。
 - ``--win`` — 只打 Windows NSIS。
 - ``--linux`` — 只打 Linux AppImage + deb。
 - ``--mac`` — 只打 macOS dmg（建议在 macOS 上执行）。
@@ -30,10 +30,39 @@ import sys
 from pathlib import Path
 
 
+def _has_vue_tsc_bin(root: Path) -> bool:
+    bin_dir = root / "node_modules" / ".bin"
+    if not bin_dir.is_dir():
+        return False
+    if sys.platform == "win32":
+        return bin_dir.joinpath("vue-tsc.cmd").is_file() or bin_dir.joinpath("vue-tsc.exe").is_file()
+    return bin_dir.joinpath("vue-tsc").is_file()
+
+
 def main() -> int:
     root = Path(__file__).resolve().parent
     shell = sys.platform == "win32"
     argv = sys.argv[1:]
+
+    if not _has_vue_tsc_bin(root):
+        print(
+            "build: node_modules missing or incomplete (no vue-tsc); running npm install…",
+            file=sys.stderr,
+            flush=True,
+        )
+        ins = subprocess.call(
+            "npm install" if shell else ["npm", "install"],
+            cwd=str(root),
+            shell=shell,
+        )
+        if ins != 0:
+            return ins
+        if not _has_vue_tsc_bin(root):
+            print(
+                "build: npm install finished but vue-tsc still missing; check package.json / network.",
+                file=sys.stderr,
+            )
+            return 1
 
     web = subprocess.call(
         "npm run build" if shell else ["npm", "run", "build"],

@@ -1,4 +1,6 @@
 import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { useLog } from './useLog'
+import { tMsg } from './useI18n'
 
 export type ThemeMode = 'system' | 'light' | 'dark'
 
@@ -34,6 +36,8 @@ export function applyStoredThemeOnBoot() {
 let themeEffectsInstalled = false
 
 export function useTheme() {
+  const { notify } = useLog()
+
   function setMode(m: ThemeMode) {
     themeMode.value = m
     applyDomTheme(m)
@@ -47,7 +51,7 @@ export function useTheme() {
       try {
         localStorage.setItem(STORAGE_KEY, m)
       } catch {
-        /* ignore */
+        notify('warn', tMsg('errThemePersist'))
       }
       applyDomTheme(m)
     })
