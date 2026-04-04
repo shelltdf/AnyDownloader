@@ -7,6 +7,8 @@
 | 包名 | 版本（约） | 许可证 | 说明 |
 |------|------------|--------|------|
 | vue | ^3.5.x | MIT | 运行时框架 |
+| path-browserify | ^1.0.x | MIT | Vite 打包时供 `parse-torrent` 使用 `path.join`（浏览器垫片） |
+| parse-torrent | ^11.x | MIT | BT 元数据解析（与 path-browserify 同捆） |
 
  SPDX：`MIT`（以各包 `package.json` / 仓库 `LICENSE` 为准）。
 
@@ -18,6 +20,8 @@
 |------|----------------|------|
 | electron | MIT | 桌面壳运行时 |
 | electron-builder 打包产物内含 Chromium 等 | 见 Electron 与 Chromium 官方条款 | 由 electron-builder 随应用分发 |
+| **aria2**（`aria2c.exe`，Windows 可选内置） | **GPL-2.0+** | 由 `any-downloader-vue/scripts/fetch-aria2-win.cjs` 自 [aria2 官方 Release](https://github.com/aria2/aria2/releases) 获取，置于 `build-resources/aria2/` 并经 `extraResources` 打入安装包 `resources/aria2/`；随包附带官方 **`COPYING`**。源码：<https://github.com/aria2/aria2> |
+| **yt-dlp**（`yt-dlp.exe`，Windows 可选内置） | **Unlicense**（以官方为准） | 由 `any-downloader-vue/scripts/fetch-ytdlp-win.cjs` 自 [yt-dlp Releases](https://github.com/yt-dlp/yt-dlp/releases) 获取，置于 `build-resources/yt-dlp/` 并经 `extraResources` 打入 `resources/yt-dlp/`。源码：<https://github.com/yt-dlp/yt-dlp> |
 
 开发依赖中的 `electron-builder`、`concurrently`、`wait-on`、`cross-env` 等**不进入**最终用户安装包（仅构建机使用）。以 `npm ls` / 各包 `LICENSE` 为准。
 
