@@ -12,11 +12,12 @@
 |------|----------------|------|
 | 标题条 | `#title-strip` | 产品名 + favicon |
 | 菜单栏 | `#menu-bar` | 文件、编辑、语言、主题、窗口、帮助；**帮助**含「下载方式」弹窗入口 |
-| 工具栏 | `#toolbar` | URL 输入、添加任务、**添加队列**、**从网页提取**、开始/暂停/删除 |
-| 下载列表 | `#download-list` | 表格；**右键**任务行打开上下文菜单（开始/暂停/删除/复制链接） |
-| 分割条 | `.splitter` | 调整列表与 Dock 区宽度 |
-| Dock Area | `#dock-area` | 下载信息（**速度曲线** SVG）、**分区域测速表** + 上传一行、**块图**（三色槽位） |
-| 状态栏 | `#status-bar` | 摘要；**点击**打开 Log 模态（`<pre>` 纯文本 + 复制） |
+| 工具栏 | `#toolbar` | URL 输入；其余为**仅图标**按钮（`aria-label` / `title` 承载文案）：添加、队列、网页提取、全部开始/暂停/删除、清理完成 |
+| 下载列表 | `#download-list` | 表格；**右键**：开始、暂停、**重新开始**、删除、复制链接 |
+| 分割条 | `.splitter-left` / `.splitter-right` | 分别调整左、右侧 Dock 与列表宽度 |
+| 左侧 Dock | `#dock-area-left` | **网络测速**（默认**折叠**，仅展开「全局状态」）；**全局状态**（总速度、曲线+实时值、写入曲线、**并行任务数**自动/手动、**最大并行任务** 1–16 默认 2、**下载压力**最小/适中/最大、多连接设置） |
+| 右侧 Dock | `#dock-area-right` | **下载信息**：**已下载 / 总大小 / 速度**同一行；`bytesReceivedForDisplay` 展示不超过总长；单连接原因、每任务连接覆盖、速度曲线。 **块图**：`active` / **`paused`**（暂停后仍显示格内饼形进度） |
+| 状态栏 | `#status-bar` | 摘要 + 全局连接策略摘要；**点击**打开 Log |
 
 ## 保存位置
 
@@ -31,7 +32,7 @@
 
 | 协议 | 行为 |
 |------|------|
-| `http` / `https` / `blob` | **HEAD** / **Range 0-0** 探测 `Content-Length` 与 `Accept-Ranges`；支持则 **6 路并行 Range** 写入分片缓冲，否则 **单流** `ReadableStream`。完成时 **`FileSystemFileHandle.createWritable()`** 或 `<a download>` |
+| `http` / `https` / `blob` | **自动优先多连接**：**HEAD** + **Range bytes=0-0** 验证 **206**；通过且已知总长则 **N 连接并行**；否则 **单流**，并在任务上记录 `singleConnReason`（`unknown_size` / `range_not_accepted` / `parallel_no_range`）及全局 `sessionDownloadInfo.bottleneck` 供界面展示。**运行中** `clampProgress` 对已知总长任务 **progress ≤ 0.99**，列表百分比 **未完成前最高显示 99%**，避免与「正在保存」混淆。`N`：**自动** 2–10 或**手动** 1–16（`useDownloadThreads.ts`）；**续传**时 `N` 以 IndexedDB `partCount` 为准。并行中若分片收到 **200** 则清空分片、**单连接重拉**并记 `parallel_no_range`。IndexedDB 仅存每片已写字节。暂停后 `finally` 钳制进度并刷新块图。合并/写盘前：`speedBps = 0`；**速度曲线**在 `isWriting` 时不采样；**每次开始下载**清空 `speedHistory`；瞬时速度用 **EMA** 平滑减轻暂停恢复尖峰。写盘耗时写入 **`sessionIoStats.writeBps`**（浏览器无系统级磁盘曲线，仅为应用测量）。落盘：**`createWritable()`** 或 `<a download>` |
 | `data:` | `fetch` → `Blob` → 同上落盘 |
 | 其他 | 可入队；**开始**时 `error` + `errNeedBackend` |
 
@@ -42,11 +43,21 @@
 
 ## 块图（32 槽）
 
-- `chunkSlots[i]`：`pending` | `active` | `done`（多段下载时按分片字节区间与 `filled` 计算覆盖；单流时按已收字节比例）。
+- `chunkSlots[i]`：`pending` | `active` | `done`；`chunkFill[i]` ∈ [0,1] 表示该格内字节完成比例（多分片按区间与 `filled` 计算；单流按连续字节比例）。
+- **传输中**格用 **conic-gradient** 自 12 点钟方向顺时针绘制饼形（`--chunk-fill`）。
 
 ## 速度曲线
 
-- 运行中按固定间隔采样 `speedBps` 写入 `speedHistory`（有上限），下载信息 Dock 内 **SVG polyline** 展示。
+- **单任务**：采样写入 `speedHistory`；**SVG polyline** + 文案展示**当前瞬时速度**（`speedBps`）。
+- **全局总速度**：约 300ms 采样 `aggregateSpeedBps`，保留约 80 点；**polyline** + 当前总速文案。
+- **应用写入**：同源定时器采样 `sessionIoStats.writeBps` 并做衰减，**polyline**（异色）+ 当前写入速文案；反映 `writeFinalBlob` / `persistParts` 等耗时推算，**非**操作系统磁盘读曲线。
+
+## 任务模型（列表展示相关字段）
+
+- `runStartedAt`：本次任务首次开始下载的时间戳（ms）；暂停续传**不重置**，用于列表「已用时间」。
+- `activeConnections`：`running` 时当前 HTTP 并行连接数；合并/写盘阶段为 0。
+- `isWriting`：数据已在内存合并完毕、正在写入最终文件时为 `true`；列表状态文案显示「正在保存」类，与「下载中」区分。
+- `singleConnReason`：并行成功为 `none`；否则为单连接原因键，与下载信息 Dock 中文案一致。
 
 ## 网络测速 Dock
 
