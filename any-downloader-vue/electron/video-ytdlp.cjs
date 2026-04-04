@@ -225,20 +225,36 @@ function registerVideoYtdlpIpc(ipcMain, dialog, BrowserWindow) {
       payload && payload.formatPreset,
       Boolean(payload && payload.embedSubs),
     )
-    const args = [...r.prefix, '--newline', '--no-playlist', '--no-cache-dir', ...fmtArgs, '-o', outTemplate, url]
+    /** 避免中文 Windows 下控制台编码与 UTF-8 不一致导致日志与 Destination 行乱码 */
+    const args = [
+      ...r.prefix,
+      '--encoding',
+      'utf-8',
+      '--newline',
+      '--no-playlist',
+      '--no-cache-dir',
+      ...fmtArgs,
+      '-o',
+      outTemplate,
+      url,
+    ]
 
     return new Promise((resolve, reject) => {
       const ent = { proc: /** @type {import('child_process').ChildProcess | null} */ (null), cancelled: false }
       activeByWcId.set(wc.id, ent)
       const p = spawn(r.exe, args, {
         cwd: outputDir,
-        env: { ...process.env },
+        env: {
+          ...process.env,
+          PYTHONIOENCODING: 'utf-8',
+          PYTHONUTF8: '1',
+        },
         shell: false,
       })
       ent.proc = p
       const send = (buf) => {
         if (wc.isDestroyed()) return
-        wc.send('video:ytdlp-log', { chunk: buf.toString() })
+        wc.send('video:ytdlp-log', { chunk: buf.toString('utf8') })
       }
       p.stdout?.on('data', send)
       p.stderr?.on('data', send)
