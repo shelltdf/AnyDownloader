@@ -11,6 +11,7 @@ import {
   pressureStrategy,
 } from './useDownloadPolicy'
 import { useLog } from './useLog'
+import { tMsg } from './useI18n'
 
 /** 选中任务与服务器 HTTP 交互摘要（按任务 id） */
 export const taskCommLogs = reactive<Record<string, string[]>>({})
@@ -128,6 +129,8 @@ export interface DownloadTask {
   threadOverride: number | null
   /** 本次任务开始下载的时间戳（ms），暂停续传不重置 */
   runStartedAt: number | null
+  /** 进入完成或错误态的时刻（ms），用于冻结已用时间展示 */
+  runFinishedAt: number | null
   /** 当前 HTTP 并行连接数；非 running 时为 0 */
   activeConnections: number
   /** 网络数据已收齐，正在写入磁盘 / 触发保存 */
@@ -157,6 +160,22 @@ function recordDiskWrite(bytes: number, ms: number) {
 }
 
 const { log } = useLog()
+
+/** 用于判断是否「同一下载任务」（去 hash，规范化 URL） */
+export function downloadIdentityKey(href: string): string {
+  try {
+    const u = new URL(href, typeof location !== 'undefined' ? location.href : undefined)
+    u.hash = ''
+    return u.href
+  } catch {
+    return href.trim()
+  }
+}
+
+function hasDuplicateDownloadHref(href: string): boolean {
+  const k = downloadIdentityKey(href)
+  return tasks.some((t) => downloadIdentityKey(t.href) === k)
+}
 
 const tasks = reactive<DownloadTask[]>([])
 const selectedId = ref<string | null>(null)
@@ -602,12 +621,28 @@ async function runHttpMultipart(task: DownloadTask, corsMsg: string) {
       merged.set(p.buffer.subarray(0, p.buffer.length), off)
       off += p.buffer.length
     }
+    for (const p of parts) {
+      if (p.filled !== p.buffer.length) {
+        throw new Error(tMsg('errIntegrityPartIncomplete'))
+      }
+    }
+    const summed = sumFilled(parts)
+    if (summed !== total) {
+      throw new Error(tMsg('errIntegrityByteMismatch', { got: summed, expected: total }))
+    }
+    if (merged.byteLength !== total) {
+      throw new Error(tMsg('errIntegrityMergedLen'))
+    }
+    const okLine = tMsg('logIntegrityOk', { n: total })
+    appendTaskCommLog(task.id, `✓ ${okLine}`)
+    log('info', okLine)
     const blob = new Blob([merged])
     task.fileName = task.saveFileName
     task.isWriting = true
     await writeFinalBlob(task.saveHandle, blob, task.saveFileName)
     task.isWriting = false
     task.progress = 1
+    task.runFinishedAt = Date.now()
     task.status = 'done'
     sessionDownloadInfo.connectionKind = 'none'
     sessionDownloadInfo.activeThreads = null
@@ -626,6 +661,7 @@ async function runHttpMultipart(task: DownloadTask, corsMsg: string) {
       }
       log('info', `已暂停: ${task.displayUrl}`)
     } else {
+      task.runFinishedAt = Date.now()
       task.status = 'error'
       const isNet =
         /failed to fetch|load failed|networkerror|aborted/i.test(err.message) || err.name === 'TypeError'
@@ -712,12 +748,30 @@ async function runHttpSingleStream(task: DownloadTask, ac: AbortController) {
     task.chunkFill[i] = 1
   }
 
+  let totalGot = 0
+  for (const c of chunks) totalGot += c.length
+  task.bytesReceived = totalGot
+  capBytesToTotal(task)
+  if (task.totalBytes != null && task.totalBytes > 0) {
+    if (totalGot !== task.totalBytes) {
+      throw new Error(tMsg('errIntegrityByteMismatch', { got: totalGot, expected: task.totalBytes }))
+    }
+    const okLine = tMsg('logIntegrityOk', { n: totalGot })
+    appendTaskCommLog(task.id, `✓ ${okLine}`)
+    log('info', okLine)
+  } else {
+    const line = tMsg('logIntegrityNoTotal')
+    appendTaskCommLog(task.id, line)
+    log('info', line)
+  }
+
   const blob = new Blob(chunks as BlobPart[])
   task.isWriting = true
   try {
     await writeFinalBlob(task.saveHandle, blob, task.saveFileName)
     task.isWriting = false
     task.progress = 1
+    task.runFinishedAt = Date.now()
     task.status = 'done'
     await idbDeletePartial(task.id)
     log('info', `完成: ${task.saveFileName} (${task.bytesReceived} B)`)
@@ -748,6 +802,7 @@ async function runDataTask(task: DownloadTask) {
     const blob = await res.blob()
     task.bytesReceived = blob.size
     task.totalBytes = blob.size
+    appendTaskCommLog(task.id, `✓ ${tMsg('logIntegrityOk', { n: blob.size })}`)
     task.progress = 0.99
     for (let i = 0; i < CHUNK_SLOTS; i++) {
       task.chunkSlots[i] = 'done'
@@ -759,10 +814,12 @@ async function runDataTask(task: DownloadTask) {
     await writeFinalBlob(task.saveHandle, blob, task.saveFileName)
     task.isWriting = false
     task.progress = 1
+    task.runFinishedAt = Date.now()
     task.status = 'done'
     task.activeConnections = 0
     log('info', `完成: ${task.saveFileName} (${blob.size} B)`)
   } catch (e) {
+    task.runFinishedAt = Date.now()
     task.status = 'error'
     task.errorMessage = (e as Error).message
     task.activeConnections = 0
@@ -774,6 +831,7 @@ async function runDataTask(task: DownloadTask) {
 }
 
 function placeholderFail(task: DownloadTask, i18nKey: string) {
+  task.runFinishedAt = Date.now()
   task.status = 'error'
   task.errorMessage = i18nKey
   log('warn', `${task.protocol}: ${task.href}`)
@@ -803,6 +861,7 @@ function makeTask(det: ProtocolDetectResult, save: SavePickResult): DownloadTask
     _multipart: false,
     threadOverride: null,
     runStartedAt: null,
+    runFinishedAt: null,
     activeConnections: 0,
     isWriting: false,
     singleConnReason: 'none',
@@ -823,6 +882,7 @@ function resetTaskProgress(task: DownloadTask) {
   task._parts = null
   task._multipart = false
   task.runStartedAt = null
+  task.runFinishedAt = null
   task.activeConnections = 0
   task.isWriting = false
   task.singleConnReason = 'none'
@@ -830,11 +890,16 @@ function resetTaskProgress(task: DownloadTask) {
 }
 
 export function useDownloads() {
-  function enqueueTask(det: ProtocolDetectResult, save: SavePickResult): void {
+  function enqueueTask(det: ProtocolDetectResult, save: SavePickResult): boolean {
+    if (hasDuplicateDownloadHref(det.href)) {
+      log('warn', `${tMsg('duplicateDownloadSkipped')} ${det.displayUrl}`)
+      return false
+    }
     const task = makeTask(det, save)
     tasks.push(task)
     selectedId.value = task.id
     log('info', `已添加 [${det.protocol}] → ${save.fileName}`)
+    return true
   }
 
   function setTaskThreadOverride(id: string, count: number | null) {

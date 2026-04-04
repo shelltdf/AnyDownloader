@@ -55,7 +55,6 @@ const { taskConcurrencyMode, maxConcurrentTasksManual, pressureStrategy } = useD
 const concurrentLimit = computed(() => effectiveMaxConcurrentTasks())
 const { running: speedRunning, regions, uploadMbps, uploadError, lastError, runAll, setRegionLabels } = useSpeedTest()
 
-const urlInput = ref('')
 const logOpen = ref(false)
 const helpOpen = ref(false)
 const aboutOpen = ref(false)
@@ -77,10 +76,7 @@ const addParsedRows = ref<AddParsedRow[]>([])
 const leftDockWide = ref(300)
 const rightDockWide = ref(320)
 const draggingSplit = ref(false)
-const dragTarget = ref<'left' | 'right' | 'bottom' | null>(null)
-
-const bottomDockComm = ref(true)
-const bottomDockTall = ref(200)
+const dragTarget = ref<'left' | 'right' | null>(null)
 
 const pageUrl = ref('https://example.com/')
 const pageRichLinks = ref<RichPageLink[]>([])
@@ -88,10 +84,10 @@ const pageSelected = reactive<Record<string, boolean>>({})
 const pageDirHandle = ref<FileSystemDirectoryHandle | null>(null)
 
 type LeftDockKey = 'speed' | 'global'
-type RightDockKey = 'info' | 'chunks'
+type RightDockKey = 'info' | 'chunks' | 'comm'
 
 const leftDockPanel = ref({ speed: false, global: true })
-const rightDockPanel = ref({ info: true, chunks: true })
+const rightDockPanel = ref({ info: true, chunks: true, comm: true })
 const leftDockMax = ref<LeftDockKey | null>(null)
 const rightDockMax = ref<RightDockKey | null>(null)
 
@@ -100,7 +96,9 @@ const ctx = ref<{ x: number; y: number; taskId: string } | null>(null)
 const taskThreadInput = ref('')
 
 const leftDockExpanded = computed(() => leftDockPanel.value.speed || leftDockPanel.value.global)
-const rightDockExpanded = computed(() => rightDockPanel.value.info || rightDockPanel.value.chunks)
+const rightDockExpanded = computed(
+  () => rightDockPanel.value.info || rightDockPanel.value.chunks || rightDockPanel.value.comm,
+)
 
 watch(
   () => selectedTask.value?.threadOverride,
@@ -120,11 +118,6 @@ watch(
 
 watch([leftDockExpanded, rightDockExpanded], () => {
   if (!leftDockExpanded.value && !rightDockExpanded.value) draggingSplit.value = false
-})
-
-const bottomDockAsideStyle = computed(() => {
-  if (!bottomDockComm.value) return { height: '44px' }
-  return { height: `${bottomDockTall.value}px` }
 })
 
 const commLogPanelText = computed(() => {
@@ -214,8 +207,12 @@ function formatDurationSec(sec: number): string {
 }
 
 function formatTaskElapsed(t: DownloadTask): string {
-  void uiTick.value
   if (t.runStartedAt == null) return strings.value.timeNA
+  if (t.status === 'done' || t.status === 'error') {
+    const end = t.runFinishedAt ?? Date.now()
+    return formatDurationSec((end - t.runStartedAt) / 1000)
+  }
+  void uiTick.value
   return formatDurationSec((Date.now() - t.runStartedAt) / 1000)
 }
 
@@ -429,14 +426,7 @@ async function enqueueAddModalSelections(startNow: boolean) {
   }
 }
 
-function onUrlBarEnter() {
-  const t = urlInput.value.trim()
-  urlInput.value = ''
-  void openAddModal(t)
-}
-
 function clearAndOpenAdd() {
-  urlInput.value = ''
   void openAddModalFresh()
 }
 
@@ -495,30 +485,15 @@ function onSplitRightDown(e: MouseEvent) {
   e.preventDefault()
 }
 
-function onSplitBottomDown(e: MouseEvent) {
-  if (!bottomDockComm.value) return
-  dragTarget.value = 'bottom'
-  draggingSplit.value = true
-  e.preventDefault()
-}
-
 function onMove(e: MouseEvent) {
   if (!draggingSplit.value || !dragTarget.value) return
-  if (dragTarget.value === 'bottom') {
-    const col = document.getElementById('main-column')
-    if (!col) return
-    const r = col.getBoundingClientRect()
-    const h = Math.round(r.bottom - e.clientY)
-    bottomDockTall.value = Math.min(Math.max(h, 120), Math.min(520, r.height - 160))
-    return
-  }
   const row = document.getElementById('main-row')
   if (!row) return
   const r = row.getBoundingClientRect()
   if (dragTarget.value === 'left') {
     leftDockWide.value = Math.min(Math.max(e.clientX - r.left, 200), 520)
   } else {
-    rightDockWide.value = Math.min(Math.max(r.right - e.clientX - 44, 200), 560)
+    rightDockWide.value = Math.min(Math.max(r.right - e.clientX - 40, 200), 560)
   }
 }
 
@@ -562,7 +537,21 @@ async function ctxRestart() {
 function ctxRemove() {
   const id = ctx.value?.taskId ?? null
   closeCtx()
+  if (!id) return
+  if (!window.confirm(strings.value.confirmRemoveTask)) return
   removeTask(id)
+}
+
+function onRemoveAllTasks() {
+  if (!tasks.length) return
+  if (!window.confirm(strings.value.confirmRemoveAll)) return
+  removeAllTasks()
+}
+
+function onClearDoneTasks() {
+  if (!tasks.some((t) => t.status === 'done')) return
+  if (!window.confirm(strings.value.confirmClearDone)) return
+  clearDoneTasks()
 }
 
 async function ctxCopyUrl() {
@@ -668,10 +657,6 @@ function toggleRightMax(k: RightDockKey) {
   rightDockMax.value = rightDockMax.value === k ? null : k
 }
 
-function toggleBottomDock() {
-  bottomDockComm.value = !bottomDockComm.value
-}
-
 onMounted(() => {
   window.addEventListener('mousemove', onMove)
   window.addEventListener('mouseup', onUp)
@@ -701,13 +686,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div
-    class="app-root"
-    :class="{
-      'is-dragging': draggingSplit && dragTarget !== 'bottom',
-      'is-dragging-v': draggingSplit && dragTarget === 'bottom',
-    }"
-  >
+  <div class="app-root" :class="{ 'is-dragging': draggingSplit }">
     <header id="title-strip" class="title-strip">
       <img class="app-icon" src="/favicon.svg" width="20" height="20" alt="" />
       <span class="app-name">{{ strings.appTitle }}</span>
@@ -726,8 +705,8 @@ onUnmounted(() => {
               {{ strings.toolbarAllStart }}
             </button>
             <button type="button" class="menu-item" @click="pauseAll">{{ strings.toolbarAllPause }}</button>
-            <button type="button" class="menu-item" @click="removeAllTasks">{{ strings.toolbarAllRemove }}</button>
-            <button type="button" class="menu-item" @click="clearDoneTasks">{{ strings.toolbarClearDone }}</button>
+            <button type="button" class="menu-item" @click="onRemoveAllTasks">{{ strings.toolbarAllRemove }}</button>
+            <button type="button" class="menu-item" @click="onClearDoneTasks">{{ strings.toolbarClearDone }}</button>
           </div>
         </span>
         <span class="menu-root">
@@ -752,7 +731,7 @@ onUnmounted(() => {
             <button type="button" class="menu-item" @click="toggleLeftDock('global')">{{ strings.winDockGlobal }}</button>
             <button type="button" class="menu-item" @click="toggleRightDock('info')">{{ strings.winDockInfo }}</button>
             <button type="button" class="menu-item" @click="toggleRightDock('chunks')">{{ strings.winDockChunks }}</button>
-            <button type="button" class="menu-item" @click="toggleBottomDock">{{ strings.winDockCommLog }}</button>
+            <button type="button" class="menu-item" @click="toggleRightDock('comm')">{{ strings.winDockCommLog }}</button>
           </div>
         </span>
         <span class="menu-root">
@@ -767,20 +746,11 @@ onUnmounted(() => {
     </nav>
 
     <div id="toolbar" class="toolbar">
-      <input
-        id="url-input"
-        v-model="urlInput"
-        class="url-input"
-        type="url"
-        autocomplete="off"
-        :placeholder="strings.urlPlaceholder"
-        @keydown.enter.prevent="onUrlBarEnter"
-      />
       <button
         type="button"
         class="tb-btn tb-icon"
         :aria-label="strings.toolbarAdd"
-        :title="`${strings.toolbarAdd} · Enter`"
+        :title="strings.toolbarAdd"
         @click="void openAddModalFresh()"
       >
         ➕
@@ -812,7 +782,7 @@ onUnmounted(() => {
         class="tb-btn tb-icon"
         :aria-label="strings.toolbarAllRemove"
         :title="strings.toolbarAllRemove"
-        @click="removeAllTasks"
+        @click="onRemoveAllTasks"
       >
         🗑
       </button>
@@ -821,19 +791,18 @@ onUnmounted(() => {
         class="tb-btn tb-icon"
         :aria-label="strings.toolbarClearDone"
         :title="strings.toolbarClearDone"
-        @click="clearDoneTasks"
+        @click="onClearDoneTasks"
       >
         ✓
       </button>
     </div>
 
-    <div id="main-column" class="main-column">
-      <div id="main-row" class="main-row">
+    <div id="main-row" class="main-row">
       <aside
         id="dock-area-left"
         class="dock-area dock-left"
         :class="{ 'dock-collapsed': !leftDockExpanded }"
-        :style="{ width: leftDockExpanded ? `${leftDockWide}px` : '44px' }"
+        :style="{ width: leftDockExpanded ? `${leftDockWide}px` : '40px' }"
       >
         <div id="dock-button-bar-left" class="dock-button-bar dock-button-bar-outer" role="toolbar" aria-label="Left dock">
           <button
@@ -1071,7 +1040,7 @@ onUnmounted(() => {
         id="dock-area-right"
         class="dock-area dock-right"
         :class="{ 'dock-collapsed': !rightDockExpanded }"
-        :style="{ width: rightDockExpanded ? `${rightDockWide}px` : '44px' }"
+        :style="{ width: rightDockExpanded ? `${rightDockWide}px` : '40px' }"
       >
         <div v-show="rightDockExpanded" id="dock-view-right" class="dock-view">
           <section
@@ -1194,6 +1163,33 @@ onUnmounted(() => {
               <p v-else class="muted">{{ strings.dockNoSelection }}</p>
             </div>
           </section>
+
+          <section
+            v-show="rightDockPanel.comm && (!rightDockMax || rightDockMax === 'comm')"
+            class="dock-card dock-card-comm-inline"
+            :class="{ 'dock-card-max': rightDockMax === 'comm' }"
+          >
+            <header class="dock-head">
+              <span>{{ strings.winDockCommLog }}</span>
+              <div class="dock-head-actions">
+                <button
+                  type="button"
+                  class="dock-max"
+                  :title="rightDockMax === 'comm' ? strings.dockRestore : strings.dockMaximize"
+                  @click.stop="toggleRightMax('comm')"
+                >
+                  {{ rightDockMax === 'comm' ? '⤓' : '⛶' }}
+                </button>
+                <button type="button" class="dock-fold" :title="strings.noShortcut" @click="toggleRightDock('comm')">
+                  ▾
+                </button>
+              </div>
+            </header>
+            <div class="dock-body dock-body-comm">
+              <p class="muted small dock-comm-hint">{{ strings.dockCommHint }}</p>
+              <pre class="comm-log-pre comm-log-pre-dock" tabindex="0">{{ commLogPanelText }}</pre>
+            </div>
+          </section>
         </div>
 
         <div id="dock-button-bar-right" class="dock-button-bar dock-button-bar-outer" role="toolbar" aria-label="Right dock">
@@ -1215,40 +1211,12 @@ onUnmounted(() => {
           >
             ▦
           </button>
-        </div>
-      </aside>
-    </div>
-
-      <div
-        v-show="bottomDockComm"
-        class="splitter splitter-h"
-        role="separator"
-        aria-orientation="horizontal"
-        :title="strings.noShortcut"
-        @mousedown="onSplitBottomDown"
-      />
-
-      <aside
-        id="dock-area-bottom"
-        class="dock-area dock-bottom"
-        :style="bottomDockAsideStyle"
-      >
-        <div v-show="bottomDockComm" id="dock-view-bottom" class="dock-view dock-view-bottom">
-          <section class="dock-card dock-card-comm">
-            <header class="dock-head dock-head-simple">
-              <span>{{ strings.winDockCommLog }}</span>
-            </header>
-            <p class="muted small dock-comm-hint">{{ strings.dockCommHint }}</p>
-            <pre class="comm-log-pre" tabindex="0">{{ commLogPanelText }}</pre>
-          </section>
-        </div>
-        <div id="dock-button-bar-bottom" class="dock-button-bar dock-button-bar-bottom" role="toolbar" :aria-label="strings.winDockCommLog">
           <button
             type="button"
             class="dock-btn"
-            :class="{ active: bottomDockComm }"
+            :class="{ active: rightDockPanel.comm }"
             :title="strings.winDockCommLog"
-            @click="toggleBottomDock"
+            @click="toggleRightDock('comm')"
           >
             📡
           </button>

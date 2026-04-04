@@ -2,10 +2,19 @@ import { computed, ref } from 'vue'
 
 export type Locale = 'zh' | 'en'
 
-/** 模块级语言，供各组件共享 */
-export const locale = ref<Locale>(
-  (typeof navigator !== 'undefined' && navigator.language.startsWith('zh') ? 'zh' : 'en') as Locale,
-)
+/** 根据浏览器上报的语言偏好（通常与操作系统/区域设置一致）推断默认界面语言 */
+function detectDefaultLocale(): Locale {
+  if (typeof navigator === 'undefined') return 'en'
+  const tags = [...(navigator.languages ?? []), navigator.language].filter(Boolean) as string[]
+  for (const raw of tags) {
+    const tag = raw.toLowerCase()
+    if (tag.startsWith('zh')) return 'zh'
+  }
+  return 'en'
+}
+
+/** 模块级语言，供各组件共享；未改过时与系统/浏览器中文环境一致则为中文，否则为英文 */
+export const locale = ref<Locale>(detectDefaultLocale())
 
 const messages: Record<Locale, Record<string, string>> = {
   zh: {
@@ -65,7 +74,7 @@ const messages: Record<Locale, Record<string, string>> = {
       + '【协议识别】迅雷/快车/QQ 旋风链可展开为内层 HTTP；另有 Magnet、eD2k、FTP、WebDAV 等识别项，浏览器内主要可完成 HTTP(S)/data:/blob:。\n\n'
       + '跨域受 CORS 限制，失败属站点策略。',
     aboutText: 'AnyDownloader — 通用下载管理（Vue + Vite）\n版本 0.1.0',
-    urlPlaceholder: '回车打开添加窗口并解析；或直接粘贴多行链接',
+    urlPlaceholder: '点击工具栏 ➕ 或菜单「文件 → 添加下载」开始；支持一次粘贴多链接。',
     ready: '就绪',
     tasksCount: '任务',
     toolbarAdd: '添加下载',
@@ -184,6 +193,15 @@ const messages: Record<Locale, Record<string, string>> = {
     dockCommHint: '当前选中任务与源站之间的 HTTP 记录（方法、状态码、耗时、关键响应头）。',
     dockCommEmptyNoSel: '未选择任务。',
     dockCommEmptyNoLog: '尚无 HTTP 通讯记录；开始下载后将显示 HEAD/GET 与响应摘要。',
+    confirmRemoveTask: '确定删除此下载任务？此操作不可撤销。',
+    confirmRemoveAll: '确定删除列表中的全部任务？此操作不可撤销。',
+    confirmClearDone: '确定清除所有已完成的任务？此操作不可撤销。',
+    duplicateDownloadSkipped: '已存在相同链接，未重复添加：',
+    errIntegrityPartIncomplete: '完整性校验失败：存在未下满的数据分片。',
+    errIntegrityByteMismatch: '完整性校验失败：实际 {got} 字节，宣告 {expected} 字节。',
+    errIntegrityMergedLen: '完整性校验失败：合并数据长度与总大小不一致。',
+    logIntegrityOk: '完整性校验通过（{n} 字节）。',
+    logIntegrityNoTotal: '下载结束；未获得可靠总长度，已跳过大小比对。',
   },
   en: {
     appTitle: 'AnyDownloader',
@@ -242,7 +260,7 @@ const messages: Record<Locale, Record<string, string>> = {
       + 'Protocols: thunder/flashget/qqdl decode to HTTP when possible; Magnet/P2P/FTP/etc. are detected but need a native engine in-browser.\n\n'
       + 'CORS failures are enforced by the remote site.',
     aboutText: 'AnyDownloader — download manager (Vue + Vite)\nVersion 0.1.0',
-    urlPlaceholder: 'Enter opens add window; or paste multi-line links',
+    urlPlaceholder: 'Use toolbar ➕ or File → Add downloads; paste multiple links at once.',
     ready: 'Ready',
     tasksCount: 'tasks',
     toolbarAdd: 'Add downloads',
@@ -361,7 +379,29 @@ const messages: Record<Locale, Record<string, string>> = {
     dockCommHint: 'HTTP trace for the selected task: method, status, timing, key response headers.',
     dockCommEmptyNoSel: 'No task selected.',
     dockCommEmptyNoLog: 'No HTTP log yet. Start a download to see HEAD/GET entries.',
+    confirmRemoveTask: 'Remove this download task? This cannot be undone.',
+    confirmRemoveAll: 'Remove all tasks in the list? This cannot be undone.',
+    confirmClearDone: 'Clear all finished tasks? This cannot be undone.',
+    duplicateDownloadSkipped: 'Same URL already in the list; skipped:',
+    errIntegrityPartIncomplete: 'Integrity check failed: a chunk is incomplete.',
+    errIntegrityByteMismatch: 'Integrity check failed: got {got} B, declared {expected} B.',
+    errIntegrityMergedLen: 'Integrity check failed: merged size does not match total.',
+    logIntegrityOk: 'Integrity OK ({n} bytes).',
+    logIntegrityNoTotal: 'Finished; no reliable total length — size check skipped.',
   },
+}
+
+/** 供非组件模块（如 useDownloads）按当前语言取文案 */
+export function tMsg(key: string, vars?: Record<string, string | number>): string {
+  const pack = messages[locale.value] as Record<string, string>
+  const fb = messages.en as Record<string, string>
+  let s = pack[key] ?? fb[key] ?? key
+  if (vars) {
+    for (const [k, v] of Object.entries(vars)) {
+      s = s.split(`{${k}}`).join(String(v))
+    }
+  }
+  return s
 }
 
 export function useI18n() {

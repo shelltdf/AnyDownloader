@@ -10,6 +10,17 @@
 
  SPDX：`MIT`（以各包 `package.json` / 仓库 `LICENSE` 为准）。
 
+## Electron 桌面套壳（构建期 / 打包进安装包）
+
+以下在 **`npm install` 的 devDependencies** 中，但会进入 **electron-builder 打出的安装包/可执行文件**（Electron 运行时与 Chromium 等）：
+
+| 组件 | 许可证（常见） | 说明 |
+|------|----------------|------|
+| electron | MIT | 桌面壳运行时 |
+| electron-builder 打包产物内含 Chromium 等 | 见 Electron 与 Chromium 官方条款 | 由 electron-builder 随应用分发 |
+
+开发依赖中的 `electron-builder`、`concurrently`、`wait-on`、`cross-env` 等**不进入**最终用户安装包（仅构建机使用）。以 `npm ls` / 各包 `LICENSE` 为准。
+
 ## 数字资产
 
 | 资源 | 来源 | 许可证 |
