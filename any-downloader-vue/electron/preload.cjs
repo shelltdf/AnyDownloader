@@ -6,6 +6,17 @@ const { contextBridge, ipcRenderer } = require('electron')
 contextBridge.exposeInMainWorld('anyDownloaderShell', {
   isElectron: true,
   getVersion: () => ipcRenderer.invoke('shell:get-version'),
+  getUseNativeChrome: () => ipcRenderer.invoke('shell:get-use-native-chrome'),
+  setUseNativeChrome: (value) => ipcRenderer.invoke('shell:set-use-native-chrome', Boolean(value)),
+  /**
+   * @param {{ clientX: number; clientY: number; labels?: { nativeChrome?: string } }} payload
+   */
+  popupShellChromeMenu: (payload) => ipcRenderer.invoke('shell:popup-chrome-menu', payload),
+  pickImportDirectory: () => ipcRenderer.invoke('shell:pick-import-dir'),
+  /**
+   * @param {{ dirPath: string; fileName: string; data: ArrayBuffer }} opts
+   */
+  writeImportFile: (opts) => ipcRenderer.invoke('shell:write-import-file', opts),
   checkYtdlp: (force) => ipcRenderer.invoke('video:check-ytdlp', { force: Boolean(force) }),
   pickVideoOutputDir: () => ipcRenderer.invoke('video:pick-output-dir'),
   startVideoDownload: (payload) => ipcRenderer.invoke('video:start-download', payload),

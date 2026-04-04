@@ -139,6 +139,8 @@ export interface DownloadTask {
   chunkFill: number[]
   /** 本任务为何使用单连接（并行成功时为 none） */
   singleConnReason: SingleConnReason
+  /** Electron 网页导入：主进程选择的输出目录，完成时经 IPC 写盘 */
+  electronOutputDir: string | null
 }
 
 let idSeq = 1
@@ -234,8 +236,21 @@ function guessFileName(url: string, res: Response): string {
   return 'download'
 }
 
-async function writeFinalBlob(handle: FileSystemFileHandle | null, blob: Blob, fallbackName: string) {
+async function writeFinalBlob(task: DownloadTask, blob: Blob) {
   const t0 = performance.now()
+  const electronDir = task.electronOutputDir?.trim()
+  if (electronDir && typeof window !== 'undefined' && window.anyDownloaderShell?.writeImportFile) {
+    const buf = await blob.arrayBuffer()
+    await window.anyDownloaderShell.writeImportFile({
+      dirPath: electronDir,
+      fileName: task.saveFileName,
+      data: buf,
+    })
+    recordDiskWrite(blob.size, performance.now() - t0)
+    return
+  }
+  const handle = task.saveHandle
+  const fallbackName = task.saveFileName
   if (handle && 'createWritable' in handle) {
     const w = await handle.createWritable()
     await w.write(blob)
@@ -528,6 +543,7 @@ async function runHttpMultipart(task: DownloadTask, corsMsg: string) {
   if (task.runStartedAt == null) task.runStartedAt = Date.now()
   startSpeedSampler(task)
 
+  let multipartPersistTicker: ReturnType<typeof setInterval> | null = null
   try {
     const meta = await probeMeta(task.href, ac.signal, task.id)
     let total = meta.length
@@ -582,6 +598,10 @@ async function runHttpMultipart(task: DownloadTask, corsMsg: string) {
     sessionDownloadInfo.activeThreads = parts.length
     task.activeConnections = parts.length
     sessionDownloadInfo.bottleneck = 'none'
+
+    multipartPersistTicker = setInterval(() => {
+      if (task.status === 'running' && task._parts && task.totalBytes) void persistParts(task)
+    }, 2200)
 
     try {
       await Promise.all(parts.map((_, i) => fetchPart(task, i, ac.signal)))
@@ -639,7 +659,7 @@ async function runHttpMultipart(task: DownloadTask, corsMsg: string) {
     const blob = new Blob([merged])
     task.fileName = task.saveFileName
     task.isWriting = true
-    await writeFinalBlob(task.saveHandle, blob, task.saveFileName)
+    await writeFinalBlob(task, blob)
     task.isWriting = false
     task.progress = 1
     task.runFinishedAt = Date.now()
@@ -669,6 +689,10 @@ async function runHttpMultipart(task: DownloadTask, corsMsg: string) {
       notify('error', `${task.displayUrl}: ${task.errorMessage ?? err.message}`)
     }
   } finally {
+    if (multipartPersistTicker != null) {
+      clearInterval(multipartPersistTicker)
+      multipartPersistTicker = null
+    }
     stopSpeedSampler(task)
     task.abort = null
     if (task.status === 'paused') {
@@ -768,7 +792,7 @@ async function runHttpSingleStream(task: DownloadTask, ac: AbortController) {
   const blob = new Blob(chunks as BlobPart[])
   task.isWriting = true
   try {
-    await writeFinalBlob(task.saveHandle, blob, task.saveFileName)
+    await writeFinalBlob(task, blob)
     task.isWriting = false
     task.progress = 1
     task.runFinishedAt = Date.now()
@@ -811,7 +835,7 @@ async function runDataTask(task: DownloadTask) {
     task.speedBps = 0
     task.speedHistory.push(0)
     task.isWriting = true
-    await writeFinalBlob(task.saveHandle, blob, task.saveFileName)
+    await writeFinalBlob(task, blob)
     task.isWriting = false
     task.progress = 1
     task.runFinishedAt = Date.now()
@@ -853,6 +877,7 @@ function makeTask(det: ProtocolDetectResult, save: SavePickResult): DownloadTask
     fileName: save.fileName,
     saveFileName: save.fileName,
     saveHandle: save.handle,
+    electronOutputDir: save.electronOutputDir?.trim() || null,
     chunkSlots: emptyChunkSlots(),
     chunkFill: emptyChunkFill(),
     abort: null,
@@ -887,6 +912,162 @@ function resetTaskProgress(task: DownloadTask) {
   task.isWriting = false
   task.singleConnReason = 'none'
   void idbDeletePartial(task.id)
+}
+
+// —— 任务列表持久化（localStorage）：关闭窗口/重启后保留，除非用户删除或清理完成项 ——
+const TASK_LIST_STORAGE_KEY = 'any-downloader-task-list-v1'
+
+interface PersistedTaskListRow {
+  id: string
+  displayUrl: string
+  href: string
+  protocol: DetectedProtocol
+  status: TaskStatus
+  progress: number
+  bytesReceived: number
+  totalBytes: number | null
+  errorMessage: string | null
+  fileName: string
+  saveFileName: string
+  threadOverride: number | null
+  runStartedAt: number | null
+  runFinishedAt: number | null
+  chunkSlots: ChunkSlotState[]
+  chunkFill: number[]
+  singleConnReason: SingleConnReason
+  electronOutputDir?: string | null
+}
+
+function serializeTaskForList(t: DownloadTask): PersistedTaskListRow {
+  return {
+    id: t.id,
+    displayUrl: t.displayUrl,
+    href: t.href,
+    protocol: t.protocol,
+    status: t.status,
+    progress: t.progress,
+    bytesReceived: t.bytesReceived,
+    totalBytes: t.totalBytes,
+    errorMessage: t.errorMessage,
+    fileName: t.fileName,
+    saveFileName: t.saveFileName,
+    threadOverride: t.threadOverride,
+    runStartedAt: t.runStartedAt,
+    runFinishedAt: t.runFinishedAt,
+    chunkSlots: [...t.chunkSlots],
+    chunkFill: [...t.chunkFill],
+    singleConnReason: t.singleConnReason,
+    electronOutputDir: t.electronOutputDir,
+  }
+}
+
+function deserializeTaskRow(row: PersistedTaskListRow): DownloadTask {
+  let st: TaskStatus = row.status
+  if (st === 'running') st = 'paused'
+  const slots =
+    Array.isArray(row.chunkSlots) && row.chunkSlots.length === CHUNK_SLOTS ? [...row.chunkSlots] : emptyChunkSlots()
+  const fill =
+    Array.isArray(row.chunkFill) && row.chunkFill.length === CHUNK_SLOTS ? [...row.chunkFill] : emptyChunkFill()
+  return {
+    id: row.id,
+    displayUrl: row.displayUrl,
+    href: row.href,
+    protocol: row.protocol,
+    status: st,
+    progress: Number.isFinite(row.progress) ? row.progress : 0,
+    bytesReceived: Number.isFinite(row.bytesReceived) ? row.bytesReceived : 0,
+    totalBytes: row.totalBytes != null && Number.isFinite(row.totalBytes) ? row.totalBytes : null,
+    speedBps: 0,
+    speedHistory: [],
+    errorMessage: row.errorMessage,
+    fileName: row.fileName,
+    saveFileName: row.saveFileName,
+    saveHandle: null,
+    electronOutputDir: typeof row.electronOutputDir === 'string' && row.electronOutputDir.trim() ? row.electronOutputDir.trim() : null,
+    chunkSlots: slots,
+    chunkFill: fill,
+    abort: null,
+    _parts: null,
+    _speedTimer: null,
+    _multipart: false,
+    threadOverride:
+      row.threadOverride != null && Number.isFinite(row.threadOverride)
+        ? Math.min(16, Math.max(1, Math.floor(row.threadOverride)))
+        : null,
+    runStartedAt: row.runStartedAt,
+    runFinishedAt: row.runFinishedAt,
+    activeConnections: 0,
+    isWriting: false,
+    singleConnReason: row.singleConnReason ?? 'none',
+  }
+}
+
+function syncIdSeqFromTaskList() {
+  let max = 0
+  for (const t of tasks) {
+    const m = /^t-(\d+)$/.exec(t.id)
+    if (m) max = Math.max(max, Number(m[1]))
+  }
+  idSeq = Math.max(idSeq, max + 1)
+}
+
+let taskListPersistReady = false
+let taskListPersistTimer: ReturnType<typeof setTimeout> | null = null
+
+function flushTaskListToStorage() {
+  if (typeof localStorage === 'undefined') return
+  try {
+    const rows = tasks.map(serializeTaskForList)
+    localStorage.setItem(TASK_LIST_STORAGE_KEY, JSON.stringify(rows))
+  } catch (e) {
+    console.error('task list persist', e)
+  }
+}
+
+function scheduleTaskListPersist() {
+  if (!taskListPersistReady) return
+  if (taskListPersistTimer != null) clearTimeout(taskListPersistTimer)
+  taskListPersistTimer = setTimeout(() => {
+    taskListPersistTimer = null
+    flushTaskListToStorage()
+  }, 400)
+}
+
+function loadTaskListFromStorage() {
+  if (typeof localStorage === 'undefined') return
+  try {
+    const raw = localStorage.getItem(TASK_LIST_STORAGE_KEY)
+    if (!raw) return
+    const arr = JSON.parse(raw) as unknown
+    if (!Array.isArray(arr)) return
+    for (const item of arr) {
+      if (!item || typeof item !== 'object') continue
+      const row = item as PersistedTaskListRow
+      if (typeof row.id !== 'string' || typeof row.href !== 'string') continue
+      tasks.push(deserializeTaskRow(row))
+    }
+    syncIdSeqFromTaskList()
+    for (const t of tasks) {
+      if (t.status === 'running') t.status = 'paused'
+      capBytesToTotal(t)
+      clampProgress(t)
+      if (t.totalBytes && t.totalBytes > 0) refreshChunkSlotsFromBytes(t)
+      else refreshChunkSlots(t)
+    }
+  } catch (e) {
+    console.error('task list load', e)
+  }
+}
+
+loadTaskListFromStorage()
+taskListPersistReady = true
+
+watch(tasks, () => scheduleTaskListPersist(), { deep: true })
+
+if (typeof window !== 'undefined') {
+  const flushOnExit = () => flushTaskListToStorage()
+  window.addEventListener('pagehide', flushOnExit)
+  window.addEventListener('beforeunload', flushOnExit)
 }
 
 export function useDownloads() {

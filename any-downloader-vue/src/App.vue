@@ -39,11 +39,10 @@ const {
   isElectron,
   shellVersion,
   maximized,
-  electronChromeVisible,
+  useNativeOsChrome,
   winMinimize,
   winMaximizeToggle,
   winClose,
-  toggleElectronChromeFromContextMenu,
 } = useElectronShell()
 
 const {
@@ -99,7 +98,12 @@ watch(
 function onShellChromeContextMenu(e: MouseEvent) {
   if (!isElectron) return
   e.preventDefault()
-  toggleElectronChromeFromContextMenu()
+  const shell = window.anyDownloaderShell
+  void shell?.popupShellChromeMenu?.({
+    clientX: e.clientX,
+    clientY: e.clientY,
+    labels: { nativeChrome: strings.value.shellMenuNativeChrome },
+  })
 }
 const {
   tasks,
@@ -165,6 +169,46 @@ const pageRichLinks = ref<RichPageLink[]>([])
 const pageSelected = reactive<Record<string, boolean>>({})
 const pageKindVisibility = reactive<Partial<Record<PageResourceKind, boolean>>>({})
 const pageDirHandle = ref<FileSystemDirectoryHandle | null>(null)
+/** Electron：原生对话框返回的完整目录路径，用于展示与 IPC 落盘 */
+const pageDirFullPath = ref<string | null>(null)
+const pageFetchBusy = ref(false)
+
+const pageDirDisplayLine = computed(() => {
+  if (pageDirFullPath.value) return pageDirFullPath.value
+  if (pageDirHandle.value) return pageDirHandle.value.name
+  return ''
+})
+
+const pageDirBrowserOnlyNameHint = computed(() => !!(pageDirHandle.value && !pageDirFullPath.value))
+
+/** Electron：上次选择的网页导入目录，关闭弹窗/重启应用后仍保留 */
+const PAGE_IMPORT_DIR_STORAGE_KEY = 'any-downloader-page-import-dir'
+
+function loadPersistedPageImportDir() {
+  if (typeof localStorage === 'undefined') return
+  try {
+    if (!window.anyDownloaderShell) return
+    const raw = localStorage.getItem(PAGE_IMPORT_DIR_STORAGE_KEY)
+    const p = raw?.trim()
+    if (p) pageDirFullPath.value = p
+  } catch {
+    /* ignore */
+  }
+}
+
+function persistPageImportDir(path: string) {
+  if (typeof localStorage === 'undefined') return
+  try {
+    if (!window.anyDownloaderShell) return
+    localStorage.setItem(PAGE_IMPORT_DIR_STORAGE_KEY, path.trim())
+  } catch {
+    /* ignore */
+  }
+}
+
+watch(pageModalOpen, (open) => {
+  if (!open) pageFetchBusy.value = false
+})
 
 const visiblePageLinks = computed(() =>
   pageRichLinks.value.filter((r) => pageKindVisibility[r.kind] !== false),
@@ -182,6 +226,32 @@ const pageKindChips = computed(() => {
     .map(([kind, v]) => ({ kind, ...v }))
     .sort((a, b) => String(a.kind).localeCompare(String(b.kind)))
 })
+
+function pageKindDownloadableRows(kind: PageResourceKind) {
+  return pageRichLinks.value.filter((r) => r.kind === kind && r.canTryHttpDownload)
+}
+
+function pageKindAllSelected(kind: PageResourceKind) {
+  const rows = pageKindDownloadableRows(kind)
+  if (!rows.length) return false
+  return rows.every((r) => pageSelected[r.url])
+}
+
+function pageKindSomeSelected(kind: PageResourceKind) {
+  const rows = pageKindDownloadableRows(kind)
+  if (!rows.length) return false
+  const n = rows.filter((r) => pageSelected[r.url]).length
+  return n > 0 && n < rows.length
+}
+
+/** 对勾：全选则清空该类型可下载项，否则全选该类型可下载项 */
+function togglePageKindSelection(kind: PageResourceKind) {
+  const rows = pageKindDownloadableRows(kind)
+  if (!rows.length) return
+  const all = pageKindAllSelected(kind)
+  const v = !all
+  for (const r of rows) pageSelected[r.url] = v
+}
 
 type LeftDockKey = 'speed' | 'global'
 type RightDockKey = 'info' | 'chunks' | 'comm'
@@ -801,34 +871,47 @@ function togglePageKindVisible(kind: PageResourceKind) {
   pageKindVisibility[kind] = !cur
 }
 
-function pageSelectByKind(kind: PageResourceKind) {
-  for (const row of pageRichLinks.value) {
-    if (row.kind === kind && row.canTryHttpDownload) pageSelected[row.url] = true
-  }
-}
-
 async function fetchPageLinks() {
-  const r = await extractHttpLinksFromPage(pageUrl.value)
-  if (r.error) {
-    const msg = `${strings.value.pageFetchFailed}: ${r.error}`
-    log('error', msg)
-    notify('error', msg, { persist: true })
-    pageRichLinks.value = []
+  if (pageFetchBusy.value) return
+  pageFetchBusy.value = true
+  try {
+    const r = await extractHttpLinksFromPage(pageUrl.value)
+    if (r.error) {
+      const msg = `${strings.value.pageFetchFailed}: ${r.error}`
+      log('error', msg)
+      notify('error', msg, { persist: true })
+      pageRichLinks.value = []
+      for (const k of Object.keys(pageSelected)) delete pageSelected[k]
+      for (const key of Object.keys(pageKindVisibility) as PageResourceKind[]) delete pageKindVisibility[key]
+      return
+    }
+    pageRichLinks.value = r.links
     for (const k of Object.keys(pageSelected)) delete pageSelected[k]
-    for (const key of Object.keys(pageKindVisibility) as PageResourceKind[]) delete pageKindVisibility[key]
-    return
+    resetPageKindVisibility()
+    for (const row of r.links) {
+      pageSelected[row.url] = row.canTryHttpDownload
+    }
+    if (!r.links.length) notify('warn', strings.value.pageNoLinks)
+  } finally {
+    pageFetchBusy.value = false
   }
-  pageRichLinks.value = r.links
-  for (const k of Object.keys(pageSelected)) delete pageSelected[k]
-  resetPageKindVisibility()
-  for (const row of r.links) {
-    pageSelected[row.url] = row.canTryHttpDownload
-  }
-  if (!r.links.length) notify('warn', strings.value.pageNoLinks)
 }
 
 async function choosePageDir() {
   try {
+    const shell = window.anyDownloaderShell
+    if (shell?.pickImportDirectory) {
+      const picked = await shell.pickImportDirectory()
+      if (picked && typeof picked.path === 'string' && picked.path.trim()) {
+        const dirPath = picked.path.trim()
+        pageDirFullPath.value = dirPath
+        pageDirHandle.value = null
+        persistPageImportDir(dirPath)
+        return
+      }
+      return
+    }
+    pageDirFullPath.value = null
     const d = await pickSaveDirectory()
     pageDirHandle.value = d
     if (!d) notify('warn', strings.value.pageDirRequired)
@@ -864,7 +947,8 @@ async function openPageImportModal() {
 
 async function addSelectedFromPage(startNow: boolean) {
   const dir = pageDirHandle.value
-  if (!dir) {
+  const electronDir = pageDirFullPath.value?.trim() || null
+  if (!dir && !electronDir) {
     notify('warn', strings.value.pageDirRequired)
     return
   }
@@ -876,8 +960,12 @@ async function addSelectedFromPage(startNow: boolean) {
     if (!['http', 'https', 'blob', 'data'].includes(det.protocol)) continue
     const name = guessNameFromUrl(det.href)
     try {
-      const handle = await dir.getFileHandle(name, { create: true })
-      enqueueTask(det, { fileName: name, handle })
+      if (electronDir) {
+        enqueueTask(det, { fileName: name, handle: null, electronOutputDir: electronDir })
+      } else {
+        const handle = await dir!.getFileHandle(name, { create: true })
+        enqueueTask(det, { fileName: name, handle })
+      }
     } catch (e) {
       const msg = `${name}: ${(e as Error).message}`
       log('error', msg)
@@ -932,6 +1020,7 @@ function toggleRightMax(k: RightDockKey) {
 }
 
 onMounted(() => {
+  loadPersistedPageImportDir()
   window.addEventListener('mousemove', onMove)
   window.addEventListener('mouseup', onUp)
   window.addEventListener('keydown', onF1)
@@ -962,9 +1051,12 @@ onUnmounted(() => {
 <template>
   <div
     class="app-root"
-    :class="{ 'is-dragging': draggingSplit, 'is-electron-shell': isElectron }"
+    :class="{
+      'is-dragging': draggingSplit,
+      'is-electron-shell': isElectron,
+      'native-os-chrome': isElectron && useNativeOsChrome,
+    }"
   >
-    <template v-if="!isElectron || electronChromeVisible">
     <header
       id="title-strip"
       class="title-strip"
@@ -976,7 +1068,12 @@ onUnmounted(() => {
         <span class="app-name">{{ strings.appTitle }}</span>
         <span v-if="appVersion" class="app-version muted">v{{ appVersion }}</span>
       </div>
-      <div v-if="isElectron" class="shell-window-controls" role="group" :aria-label="strings.shellWindowControlsAria">
+      <div
+        v-if="isElectron && !useNativeOsChrome"
+        class="shell-window-controls"
+        role="group"
+        :aria-label="strings.shellWindowControlsAria"
+      >
         <button
           type="button"
           class="shell-win-btn shell-win-min"
@@ -1144,53 +1241,6 @@ onUnmounted(() => {
       >
         ✓
       </button>
-    </div>
-    </template>
-
-    <div
-      v-else-if="isElectron"
-      id="toolbar"
-      class="toolbar toolbar-shell-compact"
-      role="toolbar"
-      :title="strings.shellToolbarCompactHint"
-      @contextmenu="onShellChromeContextMenu"
-    >
-      <div class="toolbar-shell-compact-inner">
-        <div class="toolbar-shell-compact-drag">
-          <img class="app-icon" src="/favicon.svg" width="20" height="20" alt="" />
-          <span class="app-name">{{ strings.appTitle }}</span>
-          <span v-if="appVersion" class="app-version muted">v{{ appVersion }}</span>
-        </div>
-        <div class="shell-window-controls" role="group" :aria-label="strings.shellWindowControlsAria">
-          <button
-            type="button"
-            class="shell-win-btn shell-win-min"
-            :title="strings.shellWinMin"
-            :aria-label="strings.shellWinMin"
-            @click="winMinimize"
-          >
-            &#x2012;
-          </button>
-          <button
-            type="button"
-            class="shell-win-btn shell-win-max"
-            :title="maximized ? strings.shellWinRestore : strings.shellWinMax"
-            :aria-label="maximized ? strings.shellWinRestore : strings.shellWinMax"
-            @click="winMaximizeToggle"
-          >
-            {{ maximized ? '\u25a3' : '\u25a1' }}
-          </button>
-          <button
-            type="button"
-            class="shell-win-btn shell-win-close"
-            :title="strings.shellWinClose"
-            :aria-label="strings.shellWinClose"
-            @click="winClose"
-          >
-            &#x2715;
-          </button>
-        </div>
-      </div>
     </div>
 
     <div id="main-row" class="main-row">
@@ -1865,14 +1915,33 @@ onUnmounted(() => {
         <div class="page-body">
           <p class="muted small">{{ strings.pageImportHint }}</p>
           <label class="page-label">{{ strings.pageUrlLabel }}</label>
-          <input v-model="pageUrl" class="url-input page-url-inp" type="url" />
-          <div class="page-actions">
-            <button type="button" class="tb-btn" @click="fetchPageLinks">{{ strings.pageFetch }}</button>
-            <button type="button" class="tb-btn" @click="choosePageDir">{{ strings.pagePickDir }}</button>
-            <button type="button" class="tb-btn" @click="pageSelectAll(true)">{{ strings.pageSelectAll }}</button>
-            <button type="button" class="tb-btn" @click="pageSelectAll(false)">{{ strings.pageClear }}</button>
+          <input v-model="pageUrl" class="url-input page-url-inp" type="url" :disabled="pageFetchBusy" />
+          <p v-if="pageFetchBusy" class="page-fetch-hint" role="status">{{ strings.pageFetching }}</p>
+          <div class="page-actions page-actions-with-dir">
+            <button type="button" class="tb-btn" :disabled="pageFetchBusy" @click="void fetchPageLinks()">
+              {{ strings.pageFetch }}
+            </button>
+            <button type="button" class="tb-btn" :disabled="pageFetchBusy" @click="void choosePageDir()">
+              {{ strings.pagePickDir }}
+            </button>
+            <div class="page-dir-inline">
+              <template v-if="pageDirDisplayLine">
+                <span class="page-dir-label-inline">{{ strings.pageDirSelectedLabel }}</span>
+                <span class="small mono break page-dir-path-inline">📁 {{ pageDirDisplayLine }}</span>
+                <span v-if="pageDirBrowserOnlyNameHint" class="small muted page-dir-note-inline">{{
+                  strings.pageDirNameOnlyNote
+                }}</span>
+              </template>
+            </div>
           </div>
-          <p v-if="pageDirHandle" class="small mono">📁 {{ pageDirHandle.name }}</p>
+          <div class="page-actions page-actions-select-row">
+            <button type="button" class="tb-btn" :disabled="pageFetchBusy" @click="pageSelectAll(true)">
+              {{ strings.pageSelectAll }}
+            </button>
+            <button type="button" class="tb-btn" :disabled="pageFetchBusy" @click="pageSelectAll(false)">
+              {{ strings.pageClear }}
+            </button>
+          </div>
           <div v-if="pageKindChips.length" class="page-kind-section">
             <p class="small muted page-kind-hint">{{ strings.pageKindFilter }}</p>
             <div class="page-kind-chips">
@@ -1886,12 +1955,19 @@ onUnmounted(() => {
                   {{ linkKindLabel(c.kind) }} ({{ c.total }})
                 </button>
                 <button
-                  v-if="c.downloadable > 0"
                   type="button"
-                  class="tb-btn page-kind-select-btn"
-                  @click="pageSelectByKind(c.kind)"
+                  class="page-kind-tick"
+                  :class="{
+                    'page-kind-tick-all': pageKindAllSelected(c.kind),
+                    'page-kind-tick-partial': pageKindSomeSelected(c.kind),
+                  }"
+                  :disabled="c.downloadable === 0 || pageFetchBusy"
+                  :title="strings.pageKindTickTitle"
+                  :aria-label="strings.pageKindTickTitle"
+                  :aria-pressed="pageKindAllSelected(c.kind)"
+                  @click="togglePageKindSelection(c.kind)"
                 >
-                  {{ strings.pageKindSelectThis }}
+                  <span class="page-kind-tick-mark" aria-hidden="true">✓</span>
                 </button>
               </div>
             </div>

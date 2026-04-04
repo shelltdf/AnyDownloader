@@ -2,7 +2,12 @@
  * 选择保存位置（File System Access API）。
  * 不支持时返回仅文件名，由完成时 `<a download>` 落盘。
  */
-export type SavePickResult = { fileName: string; handle: FileSystemFileHandle | null }
+export type SavePickResult = {
+  fileName: string
+  handle: FileSystemFileHandle | null
+  /** Electron：网页导入时由主进程对话框得到，落盘走 IPC 写文件 */
+  electronOutputDir?: string | null
+}
 
 function sanitizeFileName(name: string): string {
   return name.replace(/[/\\?%*:|"<>]/g, '_').slice(0, 200) || 'download'

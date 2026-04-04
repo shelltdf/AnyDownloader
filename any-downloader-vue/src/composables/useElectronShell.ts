@@ -1,12 +1,11 @@
-import { onMounted, onUnmounted, ref, watch } from 'vue'
-
-const CHROME_VISIBLE_KEY = 'any-downloader-electron-chrome'
+import { onMounted, onUnmounted, ref } from 'vue'
 
 export function useElectronShell() {
   const isElectron = typeof window !== 'undefined' && !!window.anyDownloaderShell
   const shellVersion = ref('')
   const maximized = ref(false)
-  const electronChromeVisible = ref(true)
+  /** 主进程：是否使用系统原生标题栏 + 顶层应用菜单（与页内菜单/工具栏无关） */
+  const useNativeOsChrome = ref(false)
 
   let unsubMax: (() => void) | null = null
 
@@ -14,11 +13,12 @@ export function useElectronShell() {
     const s = window.anyDownloaderShell
     if (!s) return
     try {
-      const raw = localStorage.getItem(CHROME_VISIBLE_KEY)
-      if (raw === '0') electronChromeVisible.value = false
-      else if (raw === '1') electronChromeVisible.value = true
+      const r = await s.getUseNativeChrome?.()
+      if (r && typeof r.useNativeChrome === 'boolean') {
+        useNativeOsChrome.value = r.useNativeChrome
+      }
     } catch {
-      /* ignore */
+      /* 旧 preload 无此 API */
     }
     try {
       shellVersion.value = (await s.getVersion()) || ''
@@ -28,15 +28,6 @@ export function useElectronShell() {
     unsubMax = s.onMaximizedChange((v) => {
       maximized.value = v
     })
-  })
-
-  watch(electronChromeVisible, (v) => {
-    if (!isElectron) return
-    try {
-      localStorage.setItem(CHROME_VISIBLE_KEY, v ? '1' : '0')
-    } catch {
-      /* ignore */
-    }
   })
 
   onUnmounted(() => {
@@ -56,19 +47,13 @@ export function useElectronShell() {
     window.anyDownloaderShell?.windowAction('close')
   }
 
-  function toggleElectronChromeFromContextMenu() {
-    if (!isElectron) return
-    electronChromeVisible.value = !electronChromeVisible.value
-  }
-
   return {
     isElectron,
     shellVersion,
     maximized,
-    electronChromeVisible,
+    useNativeOsChrome,
     winMinimize,
     winMaximizeToggle,
     winClose,
-    toggleElectronChromeFromContextMenu,
   }
 }

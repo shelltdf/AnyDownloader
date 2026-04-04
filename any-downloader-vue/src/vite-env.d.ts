@@ -18,6 +18,19 @@ declare global {
       onVideoYtdlpLog: (callback: (data: { chunk: string }) => void) => () => void
       windowAction: (action: 'minimize' | 'maximize-toggle' | 'close') => void
       onMaximizedChange: (callback: (maximized: boolean) => void) => () => void
+      getUseNativeChrome: () => Promise<{ useNativeChrome: boolean }>
+      setUseNativeChrome: (value: boolean) => Promise<{ ok: boolean }>
+      popupShellChromeMenu: (payload: {
+        clientX: number
+        clientY: number
+        labels?: { nativeChrome?: string }
+      }) => Promise<void>
+      pickImportDirectory?: () => Promise<{ path: string } | null>
+      writeImportFile?: (opts: {
+        dirPath: string
+        fileName: string
+        data: ArrayBuffer
+      }) => Promise<{ ok: boolean }>
     }
   }
 }

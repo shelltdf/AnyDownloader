@@ -13,6 +13,26 @@
 - **依赖**：用户本机须可用 `yt-dlp` / `yt-dlp.exe` 或 `python -m yt_dlp` 等；可选环境变量 **`YT_DLP_PATH`** 指向可执行文件。
 - **UI**：`App.vue` 在 `isElectron` 时提供「文件 → 视频下载（yt-dlp）…」与工具栏 🎬；弹窗内选目录、填 http(s) URL、查看 yt-dlp 文本输出、开始/取消。
 
+## Electron 套壳：系统标题栏 / 顶层菜单与页内 UI 的关系
+
+- **页内**：`#title-strip`、`#menu-bar`、`#toolbar` 在 Electron 下**始终渲染**（与浏览器版同一套界面），不因「是否显示系统壳」而隐藏。
+- **无边框（默认）**：`BrowserWindow` 使用 `frame: false`，无系统应用菜单；页内标题条右侧保留最小化/最大化/关闭；标题条与工具栏**右键**弹出主进程 **`Menu`（勾选「显示系统标题栏与菜单栏」）**，勾选后主进程切换 `frame: true` 并设置 `Menu.setApplicationMenu`（文件/编辑/视图/窗口等），**重建窗口**（须**先 `instantiateWindow` 再 `destroy` 旧窗**，避免瞬间 0 窗口触发 `window-all-closed` → `app.quit`）；偏好写入 `userData/any-downloader-window.json`。
+- **系统壳开启时**：隐藏页内窗口控制按钮（避免与系统标题栏重复）；页内标题条拖拽区改为 `no-drag`，以免与原生标题栏冲突。
+- **preload**：`getUseNativeChrome`、`setUseNativeChrome`、`popupShellChromeMenu`（传入 `clientX`/`clientY` 与文案键）。
+
+## Electron 图标（与页内 favicon 统一）
+
+- **`build-resources/icon.png`**：与 `public/favicon.svg` 同主色与箭头造型（圆角方块），由 **`scripts/gen-app-icon.cjs`** 生成；**`npm run prebuild`**（随 `npm run build`）会重新生成。
+- **`electron/main.cjs`**：`BrowserWindow` 使用 **`nativeImage.createFromPath(build-resources/icon.png)`**，窗口与 **Windows 任务栏**使用同一图标；**`package.json` → `build.icon`** 指向同文件，供 **electron-builder** 嵌入可执行文件图标。
+- 打包 **`files`** 须包含 **`build-resources/icon.png`**，以便 asar 内主进程可解析路径。
+
+## 任务列表跨会话持久化
+
+- **`localStorage` 键 `any-downloader-task-list-v1`**：`useDownloads.ts` 将列表中**全部**任务（含排队、暂停、进行中、完成、错误）序列化保存；仅当用户 **删除任务**、**全部删除**或 **清理完成** 时从列表移除并写回。刷新、关窗、重启应用后自动加载。
+- **恢复规则**：从存储读出时，原状态为 **`running` 的改为 `paused`**，避免关窗瞬间未暂停的假「下载中」；用户可再次点「开始」续下。
+- **多连接 HTTP 续传**：仍依赖 **`downloadIdb`**（按任务 **id**）；运行中约 **2.2s** 周期 **`persistParts`**，与暂停时落库配合，减少关窗导致分片未写入的损失。
+- **`FileSystemFileHandle`** 无法 JSON 持久化，恢复后 **`saveHandle` 为 `null`**；完成写盘时走既有 **`createWritable` / `<a download>`** 回退逻辑。
+
 ## 界面区域（与实现 DOM 映射）
 
 | 区域 | 容器 id / 类 | 说明 |
@@ -29,7 +49,7 @@
 ## 保存位置
 
 - **添加入队前**须完成保存目标：`showSaveFilePicker`（支持时）或 `prompt` 回退文件名；任务携带 `saveFileName` 与可选 `FileSystemFileHandle`。
-- **从网页批量添加**：`showDirectoryPicker` 选择目录后，对每个选中链接 `getFileHandle(name, { create: true })` 与任务绑定。
+- **从网页批量添加**：获取链接时展示加载提示；**全选可见 / 清除可见**单独成行。**浏览器**：`showDirectoryPicker` + `getFileHandle`；**Electron**：`shell:pick-import-dir` 展示完整路径，`enqueueTask` 带 `electronOutputDir`，完成写盘走 `shell:write-import-file`。
 
 ## 协议检测
 
